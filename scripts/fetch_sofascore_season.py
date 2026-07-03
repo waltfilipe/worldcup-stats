@@ -33,6 +33,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = ROOT / "data" / "sofascore"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from sofascore_positions import normalize_sofascore_position, resolve_match_positions
 
 # Wyscout-style action export (compatible with app.py)
 ACTION_COLUMNS = [
@@ -54,14 +58,6 @@ ACTION_COLUMNS = [
     "away_team",
     "match_date",
 ]
-
-# SofaScore G/D/M/F → short codes used in heuristic_scoring.py
-POSITION_TO_APP = {
-    "G": "GK",
-    "D": "CB",
-    "M": "CM",
-    "F": "ST",
-}
 
 ACTION_CATEGORY_MAP: dict[str, tuple[str, str]] = {
     "pass": ("passes", "pass"),
@@ -106,16 +102,45 @@ def list_finished_matches(client, tournament_id: int, season_id: int):
 
 
 def _lineup_context(match) -> tuple[dict[int, str], dict[int, str], dict[int, Any]]:
-    """player_id → name, position (G/D/M/F), lineup entry."""
+    """player_id → name, resolved position (LB/RB/…), lineup entry."""
     name_by_id: dict[int, str] = {}
-    position_by_id: dict[int, str] = {}
+    raw_position_by_id: dict[int, str] = {}
     entry_by_id: dict[int, Any] = {}
     for entry in match.lineups.all_players():
         pid = entry.player.id
         name_by_id[pid] = entry.player.name
-        position_by_id[pid] = entry.position_match or entry.player.position or ""
+        raw_position_by_id[pid] = entry.position_match or entry.player.position or ""
         entry_by_id[pid] = entry
+
+    mean_y = _mean_action_y_by_player(match)
+    position_by_id = resolve_match_positions(
+        raw_by_player=raw_position_by_id,
+        mean_y_by_player=mean_y,
+    )
     return name_by_id, position_by_id, entry_by_id
+
+
+def _mean_action_y_by_player(match) -> dict[int, float]:
+    """Median start_y per player from on-ball actions (Wyscout 0–100 grid)."""
+    buckets: dict[int, list[float]] = {}
+    for pid, pdata in match.player_data.items():
+        if not pdata.actions:
+            continue
+        ys: list[float] = []
+        for stream in (
+            pdata.actions.passes,
+            pdata.actions.ball_carries,
+            pdata.actions.dribbles,
+            pdata.actions.defensive,
+        ):
+            for action in stream:
+                if action.start_y is not None:
+                    ys.append(float(action.start_y))
+        if ys:
+            ys.sort()
+            mid = len(ys) // 2
+            buckets[pid] = ys[mid] if len(ys) % 2 else (ys[mid - 1] + ys[mid]) / 2.0
+    return buckets
 
 
 def _match_meta(match) -> dict[str, Any]:
@@ -178,7 +203,9 @@ def _action_rows(
     return rows
 
 
-def _player_stats_rows(match, *, position_by_id: dict[int, str]) -> list[dict]:
+def _player_stats_rows(
+    match, *, position_by_id: dict[int, str], raw_position_by_id: dict[int, str]
+) -> list[dict]:
     """One row per player in the lineup with the full SofaScore statistics block."""
     meta = _match_meta(match)
     rows: list[dict] = []
@@ -191,8 +218,11 @@ def _player_stats_rows(match, *, position_by_id: dict[int, str]) -> list[dict]:
                     **meta,
                     "player_id": entry.player.id,
                     "player_name": entry.player.name,
-                    "position": raw_position,
-                    "position_app": POSITION_TO_APP.get(raw_position, raw_position),
+                    "position": position_by_id.get(entry.player.id, raw_position),
+                    "position_raw": raw_position,
+                    "position_app": normalize_sofascore_position(
+                        position_by_id.get(entry.player.id, raw_position)
+                    ),
                     "position_career": entry.player.position,
                     "shirt_number": entry.shirt_number,
                     "is_substitute": entry.is_substitute,
@@ -269,6 +299,10 @@ def fetch_match_export(
         raise RuntimeError(f"event {event_id}: missing event_detail")
 
     name_by_id, position_by_id, _ = _lineup_context(match)
+    raw_position_by_id = {
+        entry.player.id: entry.position_match or entry.player.position or ""
+        for entry in match.lineups.all_players()
+    }
     return {
         "actions": _action_rows(
             match,
@@ -276,7 +310,11 @@ def fetch_match_export(
             name_by_id=name_by_id,
             position_by_id=position_by_id,
         ),
-        "player_stats": _player_stats_rows(match, position_by_id=position_by_id),
+        "player_stats": _player_stats_rows(
+            match,
+            position_by_id=position_by_id,
+            raw_position_by_id=raw_position_by_id,
+        ),
         "shots": _shot_rows(match, name_by_id=name_by_id, position_by_id=position_by_id),
     }
 

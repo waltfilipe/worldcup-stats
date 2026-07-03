@@ -17,6 +17,7 @@ from PIL import Image
 
 from external_models import load_markov_model
 from heuristic_scoring import POSITION_GROUPS_ORDER, GROUP_COLORS, is_outfield_position, position_group
+from sofascore_positions import normalize_sofascore_position
 from scipy.interpolate import RegularGridInterpolator
 
 # ── PAGE CONFIG ────────────────────────────────────────────────
@@ -67,13 +68,11 @@ ARROW_HEADLENGTH = 1.15
 ARROW_ALPHA = 0.68
 ARROW_ALPHA_EMPH = 0.82
 ALL_GAMES_LABEL = "todos os jogos"
-DATA_CACHE_VERSION = 36
+DATA_CACHE_VERSION = 37
 SEASON_ALL_CSV_PATH = Path(__file__).resolve().parent / "season_all.csv"
 PLAYER_MATCH_STATS_PATH = Path(__file__).resolve().parent / "player_match_stats.csv"
 MIN_WC_ACTIONS_DEFAULT = 50
 DEFAULT_PLAYER_POSITION = "CM"
-# SofaScore lineup codes (G/D/M/F) → short codes used in heuristic_scoring.py
-SOFASCORE_POSITION_MAP = {"G": "GK", "D": "CB", "M": "CM", "F": "ST"}
 PLAYER_TONE_PALETTE = (
     "#5b9bd5", "#e67e22", "#22c55e", "#9333ea", "#dc2626",
     "#14b8a6", "#f472b6", "#eab308", "#6366f1", "#84cc16",
@@ -1234,18 +1233,8 @@ def _frame_to_actions(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_player_position(raw: str | None) -> str:
-    """Map SofaScore G/D/M/F or full names to short position codes."""
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return DEFAULT_PLAYER_POSITION
-    text = str(raw).strip()
-    if not text:
-        return DEFAULT_PLAYER_POSITION
-    if text in SOFASCORE_POSITION_MAP:
-        return SOFASCORE_POSITION_MAP[text]
-    from heuristic_scoring import shorten_position
-
-    short = shorten_position(text)
-    return short if short != "—" else DEFAULT_PLAYER_POSITION
+    """Map SofaScore codes (G/D/M/F, LB, ST, …) to app short codes."""
+    return normalize_sofascore_position(raw, default=DEFAULT_PLAYER_POSITION)
 
 
 def build_player_registry(frame: pd.DataFrame) -> list[dict]:
