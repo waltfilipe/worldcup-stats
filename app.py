@@ -1,6 +1,7 @@
 from io import BytesIO
 import json
 from pathlib import Path
+import sys
 
 import matplotlib
 
@@ -15,8 +16,13 @@ from matplotlib.colors import LinearSegmentedColormap, Normalize
 from mplsoccer import Pitch
 from PIL import Image
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
 from external_models import load_markov_model
 from heuristic_scoring import POSITION_GROUPS_ORDER, GROUP_COLORS, is_outfield_position, position_group
+from sofascore_positions import normalize_sofascore_position
 from scipy.interpolate import RegularGridInterpolator
 
 # ── PAGE CONFIG ────────────────────────────────────────────────
@@ -67,8 +73,15 @@ ARROW_HEADLENGTH = 1.15
 ARROW_ALPHA = 0.68
 ARROW_ALPHA_EMPH = 0.82
 ALL_GAMES_LABEL = "todos os jogos"
-DATA_CACHE_VERSION = 35
+DATA_CACHE_VERSION = 39
 SEASON_ALL_CSV_PATH = Path(__file__).resolve().parent / "season_all.csv"
+PLAYER_MATCH_STATS_PATH = Path(__file__).resolve().parent / "player_match_stats.csv"
+SEASON_SHOTS_PATH = Path(__file__).resolve().parent / "season_shots.csv"
+DATASET_FILES = (
+    (SEASON_ALL_CSV_PATH, "season_all.csv", "ações com coordenadas"),
+    (PLAYER_MATCH_STATS_PATH, "player_match_stats.csv", "box score SofaScore"),
+    (SEASON_SHOTS_PATH, "season_shots.csv", "chutes (shotmap)"),
+)
 MIN_WC_ACTIONS_DEFAULT = 50
 DEFAULT_PLAYER_POSITION = "CM"
 PLAYER_TONE_PALETTE = (
@@ -193,6 +206,8 @@ CMAP_PASS_DEST = LinearSegmentedColormap.from_list(
 )
 
 STAT_CARD_GENERAL_COLOR = "#3b82f6"
+STAT_CARD_ATTACK_COLOR = "#f59e0b"
+STAT_CARD_DEFENSE_COLOR = "#ef4444"
 STAT_CARD_IMPACT_COLOR = "#22c55e"
 STAT_CARD_XT_COLOR = "#a855f7"
 
@@ -203,6 +218,19 @@ COLOR_FAIL = "#fca5a5"
 COLOR_CARRY = "#c4b5fd"
 ALPHA_SUCCESS = 0.50
 COLOR_CARRY_BASE_ALPHA = 0.50
+DEFENSIVE_ACTION_COLORS = {
+    "tackle": "#ef4444",
+    "ball-recovery": "#22c55e",
+    "interception": "#f59e0b",
+    "clearance": "#a78bfa",
+    "block": "#06b6d4",
+    "challenge": "#fb923c",
+    "aerial": "#eab308",
+    "duel": "#94a3b8",
+    "foul": "#f472b6",
+    "error": "#dc2626",
+}
+DEFENSIVE_MARKER_SIZE = 28
 
 
 # ── COORDINATE HELPERS ───────────────────────────────────────
@@ -1230,25 +1258,284 @@ def _frame_to_actions(frame: pd.DataFrame) -> pd.DataFrame:
     return enrich_with_xt_v3(out)
 
 
+def _normalize_player_position(raw: str | None) -> str:
+    """Map SofaScore codes (G/D/M/F, LB, ST, …) to app short codes."""
+    return normalize_sofascore_position(raw, default=DEFAULT_PLAYER_POSITION)
+
+
 def build_player_registry(frame: pd.DataFrame) -> list[dict]:
     """Build player entries for all players in the season dataset."""
+    work = frame.copy()
+    work["player_id"] = work["player_id"].astype(str)
+    if "position" in work.columns:
+        work["position"] = work["position"].map(_normalize_player_position)
+        pos_by_id = (
+            work.groupby("player_id", sort=False)["position"]
+            .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else DEFAULT_PLAYER_POSITION)
+            .to_dict()
+        )
+    else:
+        pos_by_id = {}
+
     players_df = (
-        frame[["player_id", "player_name"]]
+        work[["player_id", "player_name"]]
         .drop_duplicates()
         .sort_values("player_name", kind="stable")
         .reset_index(drop=True)
     )
     registry: list[dict] = []
     for idx, row in players_df.iterrows():
+        pid = str(row["player_id"])
         registry.append(
             {
-                "code": str(row["player_id"]),
+                "code": pid,
                 "name": str(row["player_name"]),
-                "position": DEFAULT_PLAYER_POSITION,
+                "position": pos_by_id.get(pid, DEFAULT_PLAYER_POSITION),
                 "tone": PLAYER_TONE_PALETTE[idx % len(PLAYER_TONE_PALETTE)],
             }
         )
     return registry
+
+
+@st.cache_data(show_spinner=False)
+def load_player_box_stats(_cache_version: int = DATA_CACHE_VERSION) -> dict[str, dict]:
+    """Season totals from SofaScore player_match_stats.csv (xG, xA, shots, …)."""
+    if not PLAYER_MATCH_STATS_PATH.exists():
+        return {}
+
+    stats = pd.read_csv(PLAYER_MATCH_STATS_PATH, low_memory=False)
+    if stats.empty or "player_id" not in stats.columns:
+        return {}
+
+    stats["player_id"] = stats["player_id"].astype(str)
+    numeric_cols = [
+        "total_pass",
+        "accurate_pass",
+        "key_pass",
+        "total_shots",
+        "on_target_scoring_attempt",
+        "expected_goals_on_target",
+        "goals",
+        "goal_assist",
+        "expected_goals",
+        "expected_assists",
+        "rating",
+        "minutes_played",
+        "touches",
+        "total_contest",
+        "won_contest",
+        "total_tackle",
+        "won_tackle",
+        "total_clearance",
+        "outfielder_block",
+        "interception_won",
+        "ball_recovery",
+        "clearance_off_line",
+        "last_man_tackle",
+        "error_lead_to_a_shot",
+        "error_lead_to_a_goal",
+        "aerial_won",
+        "aerial_lost",
+        "duel_won",
+        "duel_lost",
+        "challenge_lost",
+        "defensive_value_normalized",
+        "pass_value_normalized",
+        "shot_value_normalized",
+    ]
+    for col in numeric_cols:
+        if col in stats.columns:
+            stats[col] = pd.to_numeric(stats[col], errors="coerce").fillna(0.0)
+
+    agg_spec: dict[str, tuple[str, str]] = {}
+    if "total_pass" in stats.columns:
+        agg_spec["passes_total_sofa"] = ("total_pass", "sum")
+    if "accurate_pass" in stats.columns:
+        agg_spec["passes_completed_sofa"] = ("accurate_pass", "sum")
+    if "key_pass" in stats.columns:
+        agg_spec["key_passes_sofa"] = ("key_pass", "sum")
+    if "total_shots" in stats.columns:
+        agg_spec["shots"] = ("total_shots", "sum")
+    if "expected_goals" in stats.columns:
+        agg_spec["xg"] = ("expected_goals", "sum")
+    if "expected_goals_on_target" in stats.columns:
+        agg_spec["xgot"] = ("expected_goals_on_target", "sum")
+    if "on_target_scoring_attempt" in stats.columns:
+        agg_spec["shots_on_target"] = ("on_target_scoring_attempt", "sum")
+    if "goal_assist" in stats.columns:
+        agg_spec["assists"] = ("goal_assist", "sum")
+    if "expected_assists" in stats.columns:
+        agg_spec["xa"] = ("expected_assists", "sum")
+    if "goals" in stats.columns:
+        agg_spec["goals"] = ("goals", "sum")
+    if "rating" in stats.columns:
+        agg_spec["rating"] = ("rating", "mean")
+    if "minutes_played" in stats.columns:
+        agg_spec["minutes"] = ("minutes_played", "sum")
+    if "touches" in stats.columns:
+        agg_spec["touches"] = ("touches", "sum")
+    if "total_contest" in stats.columns:
+        agg_spec["dribbles_attempted_sofa"] = ("total_contest", "sum")
+    if "won_contest" in stats.columns:
+        agg_spec["dribbles_won_sofa"] = ("won_contest", "sum")
+    if "total_tackle" in stats.columns:
+        agg_spec["tackles"] = ("total_tackle", "sum")
+    if "won_tackle" in stats.columns:
+        agg_spec["tackles_won"] = ("won_tackle", "sum")
+    if "interception_won" in stats.columns:
+        agg_spec["interceptions"] = ("interception_won", "sum")
+    if "total_clearance" in stats.columns:
+        agg_spec["clearances"] = ("total_clearance", "sum")
+    if "outfielder_block" in stats.columns:
+        agg_spec["blocks"] = ("outfielder_block", "sum")
+    if "ball_recovery" in stats.columns:
+        agg_spec["ball_recoveries"] = ("ball_recovery", "sum")
+    if "clearance_off_line" in stats.columns:
+        agg_spec["clearance_off_line"] = ("clearance_off_line", "sum")
+    if "last_man_tackle" in stats.columns:
+        agg_spec["last_man_tackle"] = ("last_man_tackle", "sum")
+    if "error_lead_to_a_shot" in stats.columns:
+        agg_spec["errors_lead_to_shot"] = ("error_lead_to_a_shot", "sum")
+    if "error_lead_to_a_goal" in stats.columns:
+        agg_spec["errors_lead_to_goal"] = ("error_lead_to_a_goal", "sum")
+    if "aerial_won" in stats.columns:
+        agg_spec["aerial_won"] = ("aerial_won", "sum")
+    if "duel_won" in stats.columns:
+        agg_spec["duel_won"] = ("duel_won", "sum")
+    if "duel_lost" in stats.columns:
+        agg_spec["duel_lost"] = ("duel_lost", "sum")
+    if "challenge_lost" in stats.columns:
+        agg_spec["challenge_lost"] = ("challenge_lost", "sum")
+    if "defensive_value_normalized" in stats.columns:
+        agg_spec["defensive_value"] = ("defensive_value_normalized", "mean")
+    if "pass_value_normalized" in stats.columns:
+        agg_spec["pass_value"] = ("pass_value_normalized", "mean")
+    if "shot_value_normalized" in stats.columns:
+        agg_spec["shot_value"] = ("shot_value_normalized", "mean")
+    if not agg_spec:
+        return {}
+
+    grouped = stats.groupby("player_id", sort=False).agg(**agg_spec)
+    out: dict[str, dict] = {}
+    int_fields = {
+        "passes_total_sofa", "passes_completed_sofa", "key_passes_sofa",
+        "shots", "assists", "goals", "minutes", "touches", "shots_on_target",
+        "dribbles_attempted_sofa", "dribbles_won_sofa",
+        "tackles", "tackles_won", "interceptions", "clearances", "blocks", "ball_recoveries",
+        "clearance_off_line", "last_man_tackle", "errors_lead_to_shot",
+        "errors_lead_to_goal", "aerial_won", "duel_won", "duel_lost", "challenge_lost",
+    }
+    for pid, row in grouped.iterrows():
+        entry = {k: (int(v) if k in int_fields else float(v)) for k, v in row.items()}
+        if entry.get("passes_total_sofa") and entry.get("passes_completed_sofa") is not None:
+            entry["pass_accuracy_sofa"] = round(
+                100.0 * entry["passes_completed_sofa"] / entry["passes_total_sofa"], 1
+            )
+        if entry.get("minutes"):
+            mins = entry["minutes"]
+            if entry.get("goals") is not None:
+                entry["goals_per90"] = round(entry["goals"] / mins * 90.0, 3)
+            if entry.get("xg") is not None:
+                entry["xg_per90"] = round(entry["xg"] / mins * 90.0, 3)
+        out[str(pid)] = entry
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_player_shot_stats(_cache_version: int = DATA_CACHE_VERSION) -> dict[str, dict]:
+    """Season shot aggregates from season_shots.csv."""
+    if not SEASON_SHOTS_PATH.exists():
+        return {}
+
+    shots = pd.read_csv(SEASON_SHOTS_PATH, low_memory=False)
+    if shots.empty or "player_id" not in shots.columns:
+        return {}
+
+    shots["player_id"] = shots["player_id"].astype(str)
+    if "xg" in shots.columns:
+        shots["xg"] = pd.to_numeric(shots["xg"], errors="coerce").fillna(0.0)
+    if "xgot" in shots.columns:
+        shots["xgot"] = pd.to_numeric(shots["xgot"], errors="coerce").fillna(0.0)
+
+    out: dict[str, dict] = {}
+    for pid, grp in shots.groupby("player_id", sort=False):
+        goals = int((grp["shot_type"] == "goal").sum()) if "shot_type" in grp.columns else 0
+        entry: dict = {"shots_map": len(grp)}
+        if "xg" in grp.columns:
+            entry["xg_map"] = round(float(grp["xg"].sum()), 3)
+        if "xgot" in grp.columns:
+            entry["xgot_map"] = round(float(grp["xgot"].sum()), 3)
+        entry["goals_map"] = goals
+        out[str(pid)] = entry
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_season_shots_frame(_cache_version: int = DATA_CACHE_VERSION) -> pd.DataFrame:
+    if not SEASON_SHOTS_PATH.exists():
+        return pd.DataFrame()
+    return pd.read_csv(SEASON_SHOTS_PATH, low_memory=False)
+
+
+def _merge_box_stats(
+    stats: dict,
+    player_code: str,
+    box_stats: dict[str, dict],
+    shot_stats: dict[str, dict] | None = None,
+) -> dict:
+    """Overlay SofaScore box-score and shot-map totals onto action-derived stats."""
+    merged = dict(stats)
+    extra = box_stats.get(player_code, {})
+    shots_extra = (shot_stats or {}).get(player_code, {})
+
+    for key in (
+        "shots", "xg", "xgot", "xa", "assists", "goals", "rating", "minutes", "touches",
+        "shots_on_target", "goals_per90", "xg_per90", "pass_accuracy_sofa",
+        "passes_total_sofa", "passes_completed_sofa", "key_passes_sofa",
+        "dribbles_attempted_sofa", "dribbles_won_sofa",
+        "tackles", "tackles_won", "interceptions", "clearances", "blocks",
+        "ball_recoveries", "clearance_off_line", "last_man_tackle",
+        "errors_lead_to_shot", "errors_lead_to_goal", "aerial_won",
+        "duel_won", "duel_lost", "challenge_lost",
+        "defensive_value", "pass_value", "shot_value",
+    ):
+        if key in extra:
+            val = extra[key]
+            if key in ("xg", "xgot", "xa", "rating", "defensive_value", "pass_value", "shot_value", "goals_per90", "xg_per90"):
+                merged[key] = round(float(val), 3) if key not in ("rating",) else round(float(val), 2)
+            elif key == "pass_accuracy_sofa":
+                merged[key] = float(val)
+            else:
+                merged[key] = val
+
+    if shots_extra:
+        merged["shots_map"] = shots_extra.get("shots_map")
+        merged["xg_map"] = shots_extra.get("xg_map")
+        merged["xgot_map"] = shots_extra.get("xgot_map")
+        if merged.get("shots") is None and shots_extra.get("shots_map") is not None:
+            merged["shots"] = shots_extra["shots_map"]
+        if merged.get("xg") is None and shots_extra.get("xg_map") is not None:
+            merged["xg"] = shots_extra["xg_map"]
+
+    # Prefer SofaScore passing totals when action stream is empty or thin
+    if extra.get("passes_total_sofa") and (merged.get("passes_total") or 0) == 0:
+        merged["passes_total"] = extra["passes_total_sofa"]
+        merged["passes_completed"] = extra.get("passes_completed_sofa", 0)
+        merged["passes_accuracy_pct"] = extra.get("pass_accuracy_sofa", 0.0)
+    if extra.get("key_passes_sofa") and not merged.get("key_passes"):
+        merged["key_passes"] = extra["key_passes_sofa"]
+    if extra.get("dribbles_won_sofa") and not merged.get("dribbles"):
+        merged["dribbles"] = extra["dribbles_won_sofa"]
+
+    if any(merged.get(k) is not None for k in ("tackles", "interceptions", "clearances", "blocks", "ball_recoveries")):
+        merged["defensive_total"] = int(
+            (merged.get("tackles") or 0)
+            + (merged.get("interceptions") or 0)
+            + (merged.get("clearances") or 0)
+            + (merged.get("blocks") or 0)
+            + (merged.get("ball_recoveries") or 0)
+        )
+    return merged
 
 
 @st.cache_data(show_spinner="Carregando season_all.csv…")
@@ -1259,8 +1546,8 @@ def load_season_dataset(
         return [], {}
 
     frame = pd.read_csv(SEASON_ALL_CSV_PATH, low_memory=False)
+    registry = build_player_registry(frame)
     actions = _frame_to_actions(frame)
-    registry = build_player_registry(actions)
     player_data: dict[str, pd.DataFrame] = {}
     for player in registry:
         code = player["code"]
@@ -1351,6 +1638,7 @@ def compute_player_stats(df: pd.DataFrame, variant: str | None = None) -> dict:
         "carries_total": carries_total,
         "dribbles": int((df["category"] == "dribbles").sum()),
         "tackles": _count_action(df, "tackle"),
+        "tackles_won": None,
         "interceptions": _count_action(df, "interception"),
         "clearances": _count_action(df, "clearance"),
         "ball_recoveries": _count_action(df, "ball-recovery"),
@@ -1604,6 +1892,16 @@ def _laliga_stats_to_dataframe(players: list[dict], *, show_season_ref: bool) ->
             )
         else:
             row["Σ xT passe"] = player.get("sum_xt_end_passes")
+        if player.get("xg") is not None:
+            row["xG"] = player.get("xg")
+            row["Gols"] = player.get("goals")
+            row["xA"] = player.get("xa")
+            row["Assist."] = player.get("assists")
+            row["Rating"] = player.get("rating")
+        if player.get("defensive_total") is not None:
+            row["Ações def."] = player.get("defensive_total")
+            row["Desarmes"] = player.get("tackles")
+            row["Intercept."] = player.get("interceptions")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1746,11 +2044,17 @@ def _laliga_plotly_scatter_chart(
         subset = [p for p in filtered if p.get("position_group") == group]
         if not subset:
             continue
-        names = [_laliga_player_label(p, show_season_ref=show_season_ref) for p in subset]
+        plot_subset = [
+            p for p in subset
+            if p.get(x_key) is not None and p.get(y_key) is not None
+        ]
+        if not plot_subset:
+            continue
+        names = [_laliga_player_label(p, show_season_ref=show_season_ref) for p in plot_subset]
         fig.add_trace(
             go.Scatter(
-                x=[p[x_key] for p in subset],
-                y=[p[y_key] for p in subset],
+                x=[p[x_key] for p in plot_subset],
+                y=[p[y_key] for p in plot_subset],
                 mode="markers",
                 name=group,
                 text=names,
@@ -1768,7 +2072,7 @@ def _laliga_plotly_scatter_chart(
                         p.get("sum_xt_end_passes", 0.0),
                         p.get("pass_share_of_dxt") or 0.0,
                     ]
-                    for p in subset
+                    for p in plot_subset
                 ],
                 hovertemplate=(
                     "<b>%{text}</b><br>"
@@ -1889,6 +2193,72 @@ def _laliga_style_scatter_chart(
     )
 
 
+def _laliga_xg_goals_scatter_chart(
+    players: list[dict],
+    *,
+    title: str,
+    show_season_ref: bool,
+    selected_groups: list[str],
+):
+    """xG vs gols reais (SofaScore box score)."""
+    return _laliga_plotly_scatter_chart(
+        players,
+        title=title,
+        show_season_ref=show_season_ref,
+        selected_groups=selected_groups,
+        x_key="xg",
+        y_key="goals",
+        x_label="xG (SofaScore)",
+        y_label="Gols",
+        x_hover_fmt="%{x:.2f}",
+        y_hover_fmt="%{y:.0f}",
+    )
+
+
+def _laliga_xg_dxt_scatter_chart(
+    players: list[dict],
+    *,
+    title: str,
+    show_season_ref: bool,
+    selected_groups: list[str],
+):
+    """xG vs progressão total (ΔxT)."""
+    return _laliga_plotly_scatter_chart(
+        players,
+        title=title,
+        show_season_ref=show_season_ref,
+        selected_groups=selected_groups,
+        x_key="xg",
+        y_key="sum_delta_xt",
+        x_label="xG (SofaScore)",
+        y_label="Σ ΔxT",
+        x_hover_fmt="%{x:.2f}",
+        y_hover_fmt="%{y:.3f}",
+    )
+
+
+def _laliga_defensive_scatter_chart(
+    players: list[dict],
+    *,
+    title: str,
+    show_season_ref: bool,
+    selected_groups: list[str],
+):
+    """Desarmes vs interceptações (SofaScore)."""
+    return _laliga_plotly_scatter_chart(
+        players,
+        title=title,
+        show_season_ref=show_season_ref,
+        selected_groups=selected_groups,
+        x_key="tackles",
+        y_key="interceptions",
+        x_label="Desarmes",
+        y_label="Interceptações",
+        x_hover_fmt="%{x:.0f}",
+        y_hover_fmt="%{y:.0f}",
+    )
+
+
 def _render_laliga_plotly_chart(chart_fn, **kwargs) -> None:
     """Render a Ligas Plotly chart with import-error handling."""
     scatter_fig = None
@@ -1913,12 +2283,42 @@ def _render_laliga_plotly_chart(chart_fn, **kwargs) -> None:
         )
 
 
-def _wc_player_metrics(player_data: dict[str, pd.DataFrame], player: dict) -> dict | None:
-    """Build scatter/table metrics for one WC player under heuristic v4."""
+def _dataset_file_lines() -> list[str]:
+    """Human-readable status for each expected CSV in the project root."""
+    lines: list[str] = []
+    for path, filename, description in DATASET_FILES:
+        if not path.exists():
+            lines.append(f"⚠ `{filename}` — ausente ({description})")
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                row_count = max(sum(1 for _ in handle) - 1, 0)
+        except OSError:
+            row_count = 0
+        lines.append(f"✓ `{filename}` — {row_count:,} linhas")
+    return lines
+
+
+def _players_have_sofa_stats(players: list[dict]) -> bool:
+    return any(p.get("xg") is not None or p.get("defensive_total") is not None for p in players)
+
+
+def _wc_player_metrics(
+    player_data: dict[str, pd.DataFrame],
+    player: dict,
+    box_stats: dict[str, dict] | None = None,
+    shot_stats: dict[str, dict] | None = None,
+) -> dict | None:
+    """Build scatter/table metrics for one player under heuristic v4 + SofaScore overlay."""
     df = player_data.get(player["code"], pd.DataFrame())
     if df.empty:
         return None
-    stats = compute_player_stats(df, variant="v4")
+    stats = _merge_box_stats(
+        compute_player_stats(df, variant="v4"),
+        player["code"],
+        box_stats or {},
+        shot_stats,
+    )
     carries = int(stats["carries_total"])
     passes = int(stats["passes_completed"])
     total_actions = passes + carries
@@ -1943,6 +2343,16 @@ def _wc_player_metrics(player_data: dict[str, pd.DataFrame], player: dict) -> di
         "pass_share_of_dxt": round(stats["sum_dxt_passes"] / sum_delta, 4) if sum_delta else 0.0,
         "carry_share_of_dxt": round(stats["sum_dxt_carries"] / sum_delta, 4) if sum_delta else 0.0,
         "positive_action_rate": round(stats["pos_pct"] / 100.0, 4),
+        "goals": stats.get("goals"),
+        "xg": stats.get("xg"),
+        "xg_per90": stats.get("xg_per90"),
+        "assists": stats.get("assists"),
+        "xa": stats.get("xa"),
+        "shots": stats.get("shots"),
+        "tackles": stats.get("tackles"),
+        "interceptions": stats.get("interceptions"),
+        "defensive_total": stats.get("defensive_total"),
+        "rating": stats.get("rating"),
         "_legacy_metrics": False,
     }
 
@@ -1952,10 +2362,12 @@ def _build_wc_players(
     players_registry: list[dict],
     *,
     min_actions: int = 0,
+    box_stats: dict[str, dict] | None = None,
+    shot_stats: dict[str, dict] | None = None,
 ) -> list[dict]:
     players: list[dict] = []
     for player in players_registry:
-        metrics = _wc_player_metrics(player_data, player)
+        metrics = _wc_player_metrics(player_data, player, box_stats, shot_stats)
         if metrics is None:
             continue
         if metrics.get("total_actions", 0) < min_actions:
@@ -1969,12 +2381,17 @@ def render_world_cup_tab(
     player_data: dict[str, pd.DataFrame],
     players_registry: list[dict],
 ) -> None:
-    """Full World Cup player pool — scatter charts and rankings under heuristic v4."""
-    st.markdown("### Copa do Mundo · Heurístico v4")
+    """Full player pool — scatter charts and rankings under heuristic v4."""
+    st.markdown("### Comparação · Heurístico v4")
     st.caption(
-        "Todos os jogadores da Copa no `season_all.csv`, com métricas agregadas pelo "
-        "modelo **heurístico v4** (v3.1 + bônus Top5 no último terço)."
+        "Todos os jogadores do `season_all.csv`, com métricas agregadas pelo "
+        "modelo **heurístico v4**. Com `player_match_stats.csv` e `season_shots.csv` "
+        "na raiz, também aparecem xG, defesa e outras métricas SofaScore."
     )
+
+    box_stats = load_player_box_stats()
+    shot_stats = load_player_shot_stats()
+    has_sofa = bool(box_stats) or bool(shot_stats)
 
     min_actions = st.slider(
         "Mínimo de ações (passes + conduções)",
@@ -1982,11 +2399,17 @@ def render_world_cup_tab(
         max_value=300,
         value=MIN_WC_ACTIONS_DEFAULT,
         step=10,
-        help="Filtra jogadores com pouco volume na Copa para os gráficos e tabelas.",
+        help="Filtra jogadores com pouco volume para os gráficos e tabelas.",
     )
 
     players = _laliga_prepare_players(
-        _build_wc_players(player_data, players_registry, min_actions=min_actions)
+        _build_wc_players(
+            player_data,
+            players_registry,
+            min_actions=min_actions,
+            box_stats=box_stats,
+            shot_stats=shot_stats,
+        )
     )
     if not players:
         st.warning("Nenhum jogador com dados disponíveis.")
@@ -2017,8 +2440,8 @@ def render_world_cup_tab(
             """
         )
 
-    scatter_title = "Copa do Mundo · todos os jogadores"
-    st.markdown("#### Gráficos de dispersão")
+    scatter_title = "Temporada · todos os jogadores"
+    st.markdown("#### Gráficos de dispersão (xT)")
     selected_groups = st.multiselect(
         "Filtrar grupos de posição nos gráficos",
         options=list(POSITION_GROUPS_ORDER),
@@ -2048,6 +2471,21 @@ def render_world_cup_tab(
     st.markdown("##### Passes × Conduções")
     st.caption("Perfil de estilo: mais passe vs mais condução.")
     _render_laliga_plotly_chart(_laliga_style_scatter_chart, **chart_kwargs)
+
+    if has_sofa and _players_have_sofa_stats(players):
+        st.markdown("#### Gráficos SofaScore")
+        st.caption("Métricas de `player_match_stats.csv` (xG, defesa, rating, …).")
+        st.markdown("##### xG × Gols")
+        st.caption("Eficiência de finalização vs expectativa de gol.")
+        _render_laliga_plotly_chart(_laliga_xg_goals_scatter_chart, **chart_kwargs)
+
+        st.markdown("##### xG × Σ ΔxT")
+        st.caption("Ameaça de gol (xG) vs progressão com a bola (ΔxT).")
+        _render_laliga_plotly_chart(_laliga_xg_dxt_scatter_chart, **chart_kwargs)
+
+        st.markdown("##### Desarmes × Interceptações")
+        st.caption("Perfil defensivo agregado na temporada.")
+        _render_laliga_plotly_chart(_laliga_defensive_scatter_chart, **chart_kwargs)
 
     st.markdown("#### Classificação geral")
     overall_df = _laliga_stats_to_dataframe(players, show_season_ref=False)
@@ -2116,9 +2554,10 @@ def stats_section_card(title: str, border_color: str, items: list[tuple[str, str
     st.markdown(_stats_card_shell_html(title, border_color, inner), unsafe_allow_html=True)
 
 
-def render_general_stats_card(stats: dict, tone: str) -> None:
+def render_actions_stats_card(stats: dict, tone: str) -> None:
+    """Passes/carries from coordinate data (or SofaScore fallback)."""
     stats_section_card(
-        "Geral",
+        "Ações (coordenadas)",
         tone,
         [
             ("Passes", _fmt_count(stats["passes_total"])),
@@ -2128,19 +2567,66 @@ def render_general_stats_card(stats: dict, tone: str) -> None:
             ("Crosses", _fmt_count(stats["crosses"])),
             ("Bolas longas", _fmt_count(stats["long_balls"])),
             ("Conduções", _fmt_count(stats["carries_total"])),
-            ("Dribles", _fmt_count(stats["dribbles"])),
-            ("Finalizações", _fmt_count(stats["shots"])),
-            ("xG", _fmt_decimal(stats["xg"], decimals=2)),
-            ("Assistências", _fmt_count(stats["assists"])),
-            ("xA", _fmt_decimal(stats["xa"], decimals=2)),
-            ("Desarmes", _fmt_count(stats["tackles"])),
-            ("Interceptações", _fmt_count(stats["interceptions"])),
-            ("Cortes", _fmt_count(stats["clearances"])),
-            ("Recuperações", _fmt_count(stats["ball_recoveries"])),
-            ("Bloqueios", _fmt_count(stats["blocks"])),
-            ("Ações defensivas", _fmt_count(stats["defensive_total"])),
+            ("Dribles (coords)", _fmt_count(stats["dribbles"])),
+            ("Total ações", _fmt_count(stats["total_actions"])),
         ],
     )
+
+
+def render_attack_stats_card(stats: dict, tone: str) -> None:
+    """SofaScore attacking box score + shot map."""
+    stats_section_card(
+        "Ataque (SofaScore)",
+        tone,
+        [
+            ("Gols", _fmt_count(stats.get("goals"))),
+            ("Gols /90", _fmt_decimal(stats.get("goals_per90"), decimals=2)),
+            ("Finalizações", _fmt_count(stats.get("shots"))),
+            ("No gol", _fmt_count(stats.get("shots_on_target"))),
+            ("xG", _fmt_decimal(stats.get("xg"), decimals=2)),
+            ("xG /90", _fmt_decimal(stats.get("xg_per90"), decimals=2)),
+            ("xGOT", _fmt_decimal(stats.get("xgot"), decimals=2)),
+            ("Assistências", _fmt_count(stats.get("assists"))),
+            ("xA", _fmt_decimal(stats.get("xa"), decimals=2)),
+            ("Dribles tentados", _fmt_count(stats.get("dribbles_attempted_sofa"))),
+            ("Dribles ganhos", _fmt_count(stats.get("dribbles_won_sofa"))),
+            ("Toques", _fmt_count(stats.get("touches"))),
+            ("Rating médio", _fmt_decimal(stats.get("rating"), decimals=2)),
+            ("Minutos", _fmt_count(stats.get("minutes"))),
+            ("Valor passe (norm.)", _fmt_decimal(stats.get("pass_value"), decimals=2)),
+            ("Valor chute (norm.)", _fmt_decimal(stats.get("shot_value"), decimals=2)),
+        ],
+    )
+
+
+def render_defensive_stats_card(stats: dict, tone: str) -> None:
+    """SofaScore defensive box score."""
+    stats_section_card(
+        "Defesa (SofaScore)",
+        tone,
+        [
+            ("Desarmes", _fmt_count(stats.get("tackles"))),
+            ("Desarmes ganhos", _fmt_count(stats.get("tackles_won"))),
+            ("Interceptações", _fmt_count(stats.get("interceptions"))),
+            ("Cortes", _fmt_count(stats.get("clearances"))),
+            ("Recuperações", _fmt_count(stats.get("ball_recoveries"))),
+            ("Bloqueios", _fmt_count(stats.get("blocks"))),
+            ("Corte na linha", _fmt_count(stats.get("clearance_off_line"))),
+            ("Desarme último homem", _fmt_count(stats.get("last_man_tackle"))),
+            ("Duelos ganhos", _fmt_count(stats.get("duel_won"))),
+            ("Duelos perdidos", _fmt_count(stats.get("duel_lost"))),
+            ("Aéreos ganhos", _fmt_count(stats.get("aerial_won"))),
+            ("Desafios perdidos", _fmt_count(stats.get("challenge_lost"))),
+            ("Erros → chute", _fmt_count(stats.get("errors_lead_to_shot"))),
+            ("Erros → gol", _fmt_count(stats.get("errors_lead_to_goal"))),
+            ("Ações def. (soma)", _fmt_count(stats.get("defensive_total"))),
+            ("Valor def. (norm.)", _fmt_decimal(stats.get("defensive_value"), decimals=2)),
+        ],
+    )
+
+
+def render_general_stats_card(stats: dict, tone: str) -> None:
+    render_actions_stats_card(stats, tone)
 
 
 def render_impact_card(stats: dict, tone: str) -> None:
@@ -2433,6 +2919,87 @@ def draw_carry_map(df: pd.DataFrame, player_name: str, match_label: str, *, impa
     return _save_fig(fig), fig
 
 
+def draw_defensive_map(df: pd.DataFrame, player_name: str, match_label: str, **_) -> tuple:
+    """Scatter/arrow map of defensive actions with coordinates (tackle, recovery, …)."""
+    defensive = df[df["category"] == "defensive"].copy()
+    fig, ax, pitch = _base_pitch()
+    scale = _map_scale()
+    seen_types: set[str] = set()
+
+    for _, row in defensive.iterrows():
+        action_type = str(row.get("action_type", "tackle"))
+        seen_types.add(action_type)
+        color = DEFENSIVE_ACTION_COLORS.get(action_type, "#94a3b8")
+        alpha = ARROW_ALPHA_EMPH if bool(row.get("is_success")) else ARROW_ALPHA * 0.85
+        if bool(row.get("has_end")):
+            _delicate_arrows(
+                pitch, ax,
+                row["x_start"], row["y_start"], row["x_end"], row["y_end"],
+                color, scale, alpha=alpha,
+            )
+        pitch.scatter(
+            row["x_start"], row["y_start"],
+            s=DEFENSIVE_MARKER_SIZE, marker="X", color=color,
+            edgecolors="white", linewidths=0.35, ax=ax, zorder=6, alpha=alpha,
+        )
+
+    legend_handles = [
+        Line2D(
+            [0], [0], marker="X", color="w", label=action_type.replace("-", " ").title(),
+            markerfacecolor=DEFENSIVE_ACTION_COLORS.get(action_type, "#94a3b8"),
+            markersize=6, linestyle="None",
+        )
+        for action_type in sorted(seen_types)
+    ]
+    if legend_handles:
+        _add_map_legend(ax, legend_handles)
+    ax.set_title(
+        f"{player_name}\nAções defensivas · {match_label}",
+        color="white", fontsize=8.8 * scale, pad=5,
+    )
+    _attack_arrow(fig)
+    return _save_fig(fig), fig
+
+
+SHOT_TYPE_COLORS = {
+    "goal": "#22c55e",
+    "save": "#f59e0b",
+    "miss": "#94a3b8",
+    "block": "#06b6d4",
+    "post": "#e879f9",
+}
+
+
+def draw_shots_map(shots_df: pd.DataFrame, player_name: str, match_label: str):
+    """Shot locations from season_shots.csv (SofaScore 0–100 grid)."""
+    fig, ax, pitch = _base_pitch()
+    scale = _map_scale()
+    if shots_df.empty:
+        ax.set_title(f"{player_name}\nChutes · {match_label}", color="white", fontsize=8.8 * scale, pad=5)
+        _attack_arrow(fig)
+        return _save_fig(fig), fig
+
+    flip = pd.Series(False, index=shots_df.index)
+    sx, sy = _wyscout_to_statsbomb_vec(shots_df["player_x"], shots_df["player_y"], flip)
+    seen: set[str] = set()
+    for (_, row), x, y in zip(shots_df.iterrows(), sx, sy):
+        stype = str(row.get("shot_type", "miss"))
+        seen.add(stype)
+        color = SHOT_TYPE_COLORS.get(stype, "#fbbf24")
+        size = 55 if stype == "goal" else 38
+        pitch.scatter(x, y, s=size, marker="o", color=color, edgecolors="white", linewidths=0.35, ax=ax, zorder=6, alpha=0.9)
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", color="w", label=stype.title(), markerfacecolor=SHOT_TYPE_COLORS.get(stype, "#fbbf24"), markersize=6, linestyle="None")
+        for stype in sorted(seen)
+    ]
+    if legend_handles:
+        _add_map_legend(ax, legend_handles)
+    ax.set_title(f"{player_name}\nChutes · {match_label}", color="white", fontsize=8.8 * scale, pad=5)
+    _attack_arrow(fig)
+    return _save_fig(fig), fig
+
+
 def draw_pass_destination_heatmap(
     df: pd.DataFrame, player_name: str, match_label: str, *, impact_only: bool = False,
 ):
@@ -2719,13 +3286,18 @@ def _player_selector(key: str, players_registry: list[dict]) -> dict:
 
 
 def render_player_stats_cards(stats: dict) -> None:
-    """Render the three stat cards with distinct accent colors."""
-    stat_cols = st.columns(3)
-    with stat_cols[0]:
-        render_general_stats_card(stats, STAT_CARD_GENERAL_COLOR)
-    with stat_cols[1]:
+    """Render action, attack, defense, impact and xT efficiency cards."""
+    row1 = st.columns(3)
+    with row1[0]:
+        render_actions_stats_card(stats, STAT_CARD_GENERAL_COLOR)
+    with row1[1]:
+        render_attack_stats_card(stats, STAT_CARD_ATTACK_COLOR)
+    with row1[2]:
+        render_defensive_stats_card(stats, STAT_CARD_DEFENSE_COLOR)
+    row2 = st.columns(2)
+    with row2[0]:
         render_impact_card(stats, STAT_CARD_IMPACT_COLOR)
-    with stat_cols[2]:
+    with row2[1]:
         render_xt_efficiency_card(stats, STAT_CARD_XT_COLOR)
 
 
@@ -2772,12 +3344,44 @@ def render_analysis_tab(
         )
 
     st.markdown("---")
+    st.markdown(f'<div class="map-label">Ações defensivas{label_suffix}</div>', unsafe_allow_html=True)
+    _show_map(
+        draw_defensive_map, df, player["name"], match_label,
+        "Sem ações defensivas com coordenadas. Rode o fetch com `--categories defensive` (padrão).",
+    )
+
+    st.markdown("---")
+    shots_frame = load_season_shots_frame()
+    if not shots_frame.empty and "player_id" in shots_frame.columns:
+        player_shots = shots_frame[shots_frame["player_id"].astype(str) == player["code"]]
+        if "player_x" in player_shots.columns and "player_y" in player_shots.columns:
+            st.markdown(f'<div class="map-label">Chutes (shotmap){label_suffix}</div>', unsafe_allow_html=True)
+            _show_map(
+                draw_shots_map, player_shots, player["name"], match_label,
+                "Sem chutes no `season_shots.csv` para este jogador.",
+            )
+
+    st.markdown("---")
     st.markdown("#### Estatísticas")
+    box_stats = load_player_box_stats()
+    shot_stats = load_player_shot_stats()
+    has_sofa = player["code"] in box_stats
+    has_def_actions = not df[df["category"] == "defensive"].empty
+    sources = []
+    if has_sofa:
+        sources.append("`player_match_stats.csv`")
+    if player["code"] in shot_stats:
+        sources.append("`season_shots.csv`")
+    sofa_label = " · ".join(sources) if sources else "sem box score SofaScore"
     st.caption(
         f"**{ALL_GAMES_LABEL.capitalize()}** · xT heurístico **v4** · "
-        "Finalizações, xG, assistências e xA não constam nos CSVs Wyscout."
+        f"Ataque/defesa: {sofa_label}. "
+        f"Mapa defensivo: {'com coordenadas' if has_def_actions else 'vazio'}."
     )
-    render_player_stats_cards(compute_player_stats(df))
+    stats = _merge_box_stats(
+        compute_player_stats(df), player["code"], box_stats, shot_stats
+    )
+    render_player_stats_cards(stats)
 
 
 def render_xt_model_comparison(
@@ -3359,9 +3963,9 @@ def render_xt_tests_tab(player_data: dict[str, pd.DataFrame]) -> None:
 st.markdown(
     """
     <div style="text-align:center;margin-bottom:1rem;">
-      <h1 style="margin:0;color:#eef1f7;">World Cup Stats</h1>
+      <h1 style="margin:0;color:#eef1f7;">Player Stats</h1>
       <p style="color:#94a3b8;font-size:0.95rem;margin-top:0.35rem;">
-        Copa do Mundo · todos os jogadores · xT Heurístico v4
+        Ações · SofaScore · xT Heurístico v4
       </p>
     </div>
     """,
@@ -3375,8 +3979,8 @@ player_data = {
 }
 if not players_registry or not any(not df.empty for df in player_data.values()):
     st.error(
-        "Dataset da Copa não encontrado ou vazio. "
-        f"Esperado: `{SEASON_ALL_CSV_PATH.name}` na raiz do projeto."
+        "Dataset de ações não encontrado ou vazio. "
+        f"Coloque `{SEASON_ALL_CSV_PATH.name}` na raiz do projeto."
     )
     st.stop()
 
@@ -3394,6 +3998,9 @@ with st.sidebar:
         f"{len(players_registry)} jogadores · "
         f"{sum(len(df) for df in player_data.values()):,} ações · xT v4"
     )
+    with st.expander("Arquivos de dados", expanded=False):
+        for line in _dataset_file_lines():
+            st.markdown(line)
     st.markdown("---")
     impact_plays_only = st.checkbox(
         "Apenas impact plays nos mapas",
@@ -3404,8 +4011,8 @@ with st.sidebar:
         ),
     )
 
-tab_analysis, tab_world_cup = st.tabs(
-    ["Análise", "World Cup"]
+tab_analysis, tab_season = st.tabs(
+    ["Análise", "Comparação"]
 )
 
 with tab_analysis:
@@ -3415,5 +4022,5 @@ with tab_analysis:
         impact_plays_only=impact_plays_only,
     )
 
-with tab_world_cup:
+with tab_season:
     render_world_cup_tab(player_data, players_registry)
