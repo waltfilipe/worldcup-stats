@@ -68,7 +68,7 @@ ARROW_HEADLENGTH = 1.15
 ARROW_ALPHA = 0.68
 ARROW_ALPHA_EMPH = 0.82
 ALL_GAMES_LABEL = "todos os jogos"
-DATA_CACHE_VERSION = 37
+DATA_CACHE_VERSION = 38
 SEASON_ALL_CSV_PATH = Path(__file__).resolve().parent / "season_all.csv"
 PLAYER_MATCH_STATS_PATH = Path(__file__).resolve().parent / "player_match_stats.csv"
 MIN_WC_ACTIONS_DEFAULT = 50
@@ -205,6 +205,19 @@ COLOR_FAIL = "#fca5a5"
 COLOR_CARRY = "#c4b5fd"
 ALPHA_SUCCESS = 0.50
 COLOR_CARRY_BASE_ALPHA = 0.50
+DEFENSIVE_ACTION_COLORS = {
+    "tackle": "#ef4444",
+    "ball-recovery": "#22c55e",
+    "interception": "#f59e0b",
+    "clearance": "#a78bfa",
+    "block": "#06b6d4",
+    "challenge": "#fb923c",
+    "aerial": "#eab308",
+    "duel": "#94a3b8",
+    "foul": "#f472b6",
+    "error": "#dc2626",
+}
+DEFENSIVE_MARKER_SIZE = 28
 
 
 # ── COORDINATE HELPERS ───────────────────────────────────────
@@ -1291,6 +1304,22 @@ def load_player_box_stats(_cache_version: int = DATA_CACHE_VERSION) -> dict[str,
         "rating",
         "minutes_played",
         "touches",
+        "total_tackle",
+        "won_tackle",
+        "total_clearance",
+        "outfielder_block",
+        "interception_won",
+        "ball_recovery",
+        "clearance_off_line",
+        "last_man_tackle",
+        "error_lead_to_a_shot",
+        "error_lead_to_a_goal",
+        "aerial_won",
+        "aerial_lost",
+        "duel_won",
+        "duel_lost",
+        "challenge_lost",
+        "defensive_value_normalized",
     ]
     for col in numeric_cols:
         if col in stats.columns:
@@ -1311,13 +1340,49 @@ def load_player_box_stats(_cache_version: int = DATA_CACHE_VERSION) -> dict[str,
         agg_spec["rating"] = ("rating", "mean")
     if "minutes_played" in stats.columns:
         agg_spec["minutes"] = ("minutes_played", "sum")
+    if "total_tackle" in stats.columns:
+        agg_spec["tackles"] = ("total_tackle", "sum")
+    if "won_tackle" in stats.columns:
+        agg_spec["tackles_won"] = ("won_tackle", "sum")
+    if "interception_won" in stats.columns:
+        agg_spec["interceptions"] = ("interception_won", "sum")
+    if "total_clearance" in stats.columns:
+        agg_spec["clearances"] = ("total_clearance", "sum")
+    if "outfielder_block" in stats.columns:
+        agg_spec["blocks"] = ("outfielder_block", "sum")
+    if "ball_recovery" in stats.columns:
+        agg_spec["ball_recoveries"] = ("ball_recovery", "sum")
+    if "clearance_off_line" in stats.columns:
+        agg_spec["clearance_off_line"] = ("clearance_off_line", "sum")
+    if "last_man_tackle" in stats.columns:
+        agg_spec["last_man_tackle"] = ("last_man_tackle", "sum")
+    if "error_lead_to_a_shot" in stats.columns:
+        agg_spec["errors_lead_to_shot"] = ("error_lead_to_a_shot", "sum")
+    if "error_lead_to_a_goal" in stats.columns:
+        agg_spec["errors_lead_to_goal"] = ("error_lead_to_a_goal", "sum")
+    if "aerial_won" in stats.columns:
+        agg_spec["aerial_won"] = ("aerial_won", "sum")
+    if "duel_won" in stats.columns:
+        agg_spec["duel_won"] = ("duel_won", "sum")
+    if "duel_lost" in stats.columns:
+        agg_spec["duel_lost"] = ("duel_lost", "sum")
+    if "challenge_lost" in stats.columns:
+        agg_spec["challenge_lost"] = ("challenge_lost", "sum")
+    if "defensive_value_normalized" in stats.columns:
+        agg_spec["defensive_value"] = ("defensive_value_normalized", "mean")
     if not agg_spec:
         return {}
 
     grouped = stats.groupby("player_id", sort=False).agg(**agg_spec)
     out: dict[str, dict] = {}
+    int_fields = {
+        "shots", "assists", "goals", "minutes", "tackles", "tackles_won",
+        "interceptions", "clearances", "blocks", "ball_recoveries",
+        "clearance_off_line", "last_man_tackle", "errors_lead_to_shot",
+        "errors_lead_to_goal", "aerial_won", "duel_won", "duel_lost", "challenge_lost",
+    }
     for pid, row in grouped.iterrows():
-        entry = {k: (int(v) if k in ("shots", "assists", "goals", "minutes") else float(v)) for k, v in row.items()}
+        entry = {k: (int(v) if k in int_fields else float(v)) for k, v in row.items()}
         out[str(pid)] = entry
     return out
 
@@ -1340,6 +1405,24 @@ def _merge_box_stats(stats: dict, player_code: str, box_stats: dict[str, dict]) 
         merged["goals"] = extra["goals"]
     if "rating" in extra:
         merged["rating"] = round(extra["rating"], 2)
+    for key in (
+        "tackles", "tackles_won", "interceptions", "clearances", "blocks",
+        "ball_recoveries", "clearance_off_line", "last_man_tackle",
+        "errors_lead_to_shot", "errors_lead_to_goal", "aerial_won",
+        "duel_won", "duel_lost", "challenge_lost",
+    ):
+        if key in extra:
+            merged[key] = extra[key]
+    if "defensive_value" in extra:
+        merged["defensive_value"] = round(extra["defensive_value"], 3)
+    if any(k in extra for k in ("tackles", "interceptions", "clearances", "blocks", "ball_recoveries")):
+        merged["defensive_total"] = int(
+            extra.get("tackles", merged.get("tackles") or 0)
+            + extra.get("interceptions", merged.get("interceptions") or 0)
+            + extra.get("clearances", merged.get("clearances") or 0)
+            + extra.get("blocks", merged.get("blocks") or 0)
+            + extra.get("ball_recoveries", merged.get("ball_recoveries") or 0)
+        )
     return merged
 
 
@@ -1443,6 +1526,7 @@ def compute_player_stats(df: pd.DataFrame, variant: str | None = None) -> dict:
         "carries_total": carries_total,
         "dribbles": int((df["category"] == "dribbles").sum()),
         "tackles": _count_action(df, "tackle"),
+        "tackles_won": None,
         "interceptions": _count_action(df, "interception"),
         "clearances": _count_action(df, "clearance"),
         "ball_recoveries": _count_action(df, "ball-recovery"),
@@ -2226,6 +2310,7 @@ def render_general_stats_card(stats: dict, tone: str) -> None:
             ("Assistências", _fmt_count(stats["assists"])),
             ("xA", _fmt_decimal(stats["xa"], decimals=2)),
             ("Desarmes", _fmt_count(stats["tackles"])),
+            ("Desarmes ganhos", _fmt_count(stats.get("tackles_won"))),
             ("Interceptações", _fmt_count(stats["interceptions"])),
             ("Cortes", _fmt_count(stats["clearances"])),
             ("Recuperações", _fmt_count(stats["ball_recoveries"])),
@@ -2519,6 +2604,48 @@ def draw_carry_map(df: pd.DataFrame, player_name: str, match_label: str, *, impa
     title_suffix = " · Impact" if impact_only else ""
     ax.set_title(
         f"{player_name}\nConduções{title_suffix} · {match_label}",
+        color="white", fontsize=8.8 * scale, pad=5,
+    )
+    _attack_arrow(fig)
+    return _save_fig(fig), fig
+
+
+def draw_defensive_map(df: pd.DataFrame, player_name: str, match_label: str, **_) -> tuple:
+    """Scatter/arrow map of defensive actions with coordinates (tackle, recovery, …)."""
+    defensive = df[df["category"] == "defensive"].copy()
+    fig, ax, pitch = _base_pitch()
+    scale = _map_scale()
+    seen_types: set[str] = set()
+
+    for _, row in defensive.iterrows():
+        action_type = str(row.get("action_type", "tackle"))
+        seen_types.add(action_type)
+        color = DEFENSIVE_ACTION_COLORS.get(action_type, "#94a3b8")
+        alpha = ARROW_ALPHA_EMPH if bool(row.get("is_success")) else ARROW_ALPHA * 0.85
+        if bool(row.get("has_end")):
+            _delicate_arrows(
+                pitch, ax,
+                row["x_start"], row["y_start"], row["x_end"], row["y_end"],
+                color, scale, alpha=alpha,
+            )
+        pitch.scatter(
+            row["x_start"], row["y_start"],
+            s=DEFENSIVE_MARKER_SIZE, marker="X", color=color,
+            edgecolors="white", linewidths=0.35, ax=ax, zorder=6, alpha=alpha,
+        )
+
+    legend_handles = [
+        Line2D(
+            [0], [0], marker="X", color="w", label=action_type.replace("-", " ").title(),
+            markerfacecolor=DEFENSIVE_ACTION_COLORS.get(action_type, "#94a3b8"),
+            markersize=6, linestyle="None",
+        )
+        for action_type in sorted(seen_types)
+    ]
+    if legend_handles:
+        _add_map_legend(ax, legend_handles)
+    ax.set_title(
+        f"{player_name}\nAções defensivas · {match_label}",
         color="white", fontsize=8.8 * scale, pad=5,
     )
     _attack_arrow(fig)
@@ -2864,19 +2991,28 @@ def render_analysis_tab(
         )
 
     st.markdown("---")
+    st.markdown(f'<div class="map-label">Ações defensivas{label_suffix}</div>', unsafe_allow_html=True)
+    _show_map(
+        draw_defensive_map, df, player["name"], match_label,
+        "Sem ações defensivas com coordenadas. Rode o fetch com `--categories defensive` (padrão).",
+    )
+
+    st.markdown("---")
     st.markdown("#### Estatísticas")
     box_stats = load_player_box_stats()
     has_box = player["code"] in box_stats
+    has_def_actions = not df[df["category"] == "defensive"].empty
     if has_box:
         st.caption(
             f"**{ALL_GAMES_LABEL.capitalize()}** · xT heurístico **v4** · "
-            "Finalizações, xG, assistências e xA do SofaScore (`player_match_stats.csv`)."
+            "Ataque e defesa (contagens) do SofaScore (`player_match_stats.csv`). "
+            f"Mapa defensivo: {'coordenadas no `season_all.csv`' if has_def_actions else 'sem eventos — refaça o fetch'}."
         )
     else:
         st.caption(
             f"**{ALL_GAMES_LABEL.capitalize()}** · xT heurístico **v4** · "
-            "Finalizações, xG, assistências e xA requerem `player_match_stats.csv` "
-            "(rode `scripts/fetch_sofascore_season.py --consolidate`)."
+            "Contagens de ataque/defesa requerem `player_match_stats.csv` "
+            "(rode `scripts/fetch_sofascore_season.py --consolidate --copy-season-to-root`)."
         )
     stats = _merge_box_stats(compute_player_stats(df), player["code"], box_stats)
     render_player_stats_cards(stats)

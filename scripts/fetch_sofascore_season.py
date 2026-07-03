@@ -3,8 +3,8 @@
 
 Exports three datasets per match (and consolidated season files):
 
-1. **Actions** (`season_all.csv`) — pass / carry / dribble / defensive coordinates
-   with player position from the lineup.
+1. **Actions** (`season_all.csv`) — passes, carries, dribbles and **defensive**
+   events with coordinates (tackle, ball-recovery, …).
 2. **Player match stats** (`player_match_stats.csv`) — full SofaScore box-score
    per player (xG, xA, shots, tackles, passes, rating, …).
 3. **Shots** (`season_shots.csv`) — shot-level xG / xGOT with coordinates.
@@ -65,9 +65,20 @@ ACTION_CATEGORY_MAP: dict[str, tuple[str, str]] = {
     "throw-in": ("passes", "throw-in"),
     "ball-carry": ("ball-carries", "ball-carry"),
     "dribble": ("dribbles", "dribble"),
+    # Defensive bucket (rating-breakdown) — all map to category=defensive
     "tackle": ("defensive", "tackle"),
     "ball-recovery": ("defensive", "ball-recovery"),
+    "interception": ("defensive", "interception"),
+    "clearance": ("defensive", "clearance"),
+    "block": ("defensive", "block"),
+    "challenge": ("defensive", "challenge"),
+    "aerial": ("defensive", "aerial"),
+    "duel": ("defensive", "duel"),
+    "foul": ("defensive", "foul"),
+    "error": ("defensive", "error"),
 }
+
+DEFAULT_CATEGORIES = ["passes", "ball-carries", "defensive"]
 
 
 def parse_tournament_url(url: str) -> tuple[int, int]:
@@ -143,7 +154,47 @@ def _mean_action_y_by_player(match) -> dict[int, float]:
     return buckets
 
 
-def _match_meta(match) -> dict[str, Any]:
+def _defensive_actions(pdata) -> list:
+    """All defensive actions for one player, including any raw items tacoscore skipped."""
+    actions = list(pdata.actions.defensive)
+    raw_items = (pdata.actions.raw or {}).get("defensive") or []
+    if not raw_items:
+        return actions
+
+    seen = {(a.action_type, round(a.start_x, 2), round(a.start_y, 2)) for a in actions}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        coords = item.get("playerCoordinates") or {}
+        if "x" not in coords or "y" not in coords:
+            continue
+        event_type = str(item.get("eventActionType") or "ball-recovery")
+        key = (event_type, round(float(coords["x"]), 2), round(float(coords["y"]), 2))
+        if key in seen:
+            continue
+        from tacoscore.models.actions import Action
+
+        end_coords = item.get("passEndCoordinates")
+        end_x = end_y = None
+        if isinstance(end_coords, dict) and "x" in end_coords and "y" in end_coords:
+            end_x = float(end_coords["x"])
+            end_y = float(end_coords["y"])
+        actions.append(
+            Action(
+                action_type=event_type,
+                start_x=float(coords["x"]),
+                start_y=float(coords["y"]),
+                end_x=end_x,
+                end_y=end_y,
+                outcome=bool(item.get("outcome", False)),
+                is_keypass=bool(item.get("keypass", False)),
+                is_home=bool(item.get("isHome", False)),
+            )
+        )
+        seen.add(key)
+    return actions
+
+
     summary = match.event_detail.summary
     return {
         "event_id": match.event_id,
@@ -166,7 +217,7 @@ def _action_rows(
         "passes": lambda a: a.passes,
         "ball-carries": lambda a: a.ball_carries,
         "dribbles": lambda a: a.dribbles,
-        "defensive": lambda a: a.defensive,
+        "defensive": _defensive_actions,
     }
 
     for pid, pdata in match.player_data.items():
@@ -177,7 +228,8 @@ def _action_rows(
         for stream_key, getter in stream_map.items():
             if stream_key not in categories:
                 continue
-            for action in getter(pdata.actions):
+            action_list = getter(pdata) if stream_key == "defensive" else getter(pdata.actions)
+            for action in action_list:
                 cat_label, event_type = ACTION_CATEGORY_MAP.get(
                     action.action_type,
                     (stream_key, action.action_type),
@@ -356,9 +408,9 @@ def main() -> int:
     parser.add_argument(
         "--categories",
         nargs="+",
-        default=["passes", "ball-carries"],
+        default=DEFAULT_CATEGORIES,
         choices=["passes", "ball-carries", "dribbles", "defensive"],
-        help="Action streams to export (default: passes ball-carries)",
+        help="Action streams to export (default: passes ball-carries defensive)",
     )
     parser.add_argument("--rate-limit", type=float, default=0.4)
     parser.add_argument("--resume", action="store_true")
@@ -406,6 +458,7 @@ def main() -> int:
         "n_matches": len(matches),
         "categories": sorted(categories),
         "exports": ["actions", "player_stats", "shots"],
+        "defensive_action_types": sorted(ACTION_CATEGORY_MAP[k][1] for k in ACTION_CATEGORY_MAP if ACTION_CATEGORY_MAP[k][0] == "defensive"),
         "matches": [
             {
                 "event_id": m.event_id,
@@ -450,9 +503,10 @@ def main() -> int:
 
             done.add(event_id)
             save_done(done_path, done)
+            n_def = int((actions_df["category"] == "defensive").sum()) if not actions_df.empty and "category" in actions_df.columns else 0
             print(
-                f"  → {len(actions_df)} actions, {len(stats_df)} player-rows, "
-                f"{len(shots_df)} shots"
+                f"  → {len(actions_df)} actions ({n_def} defensive), "
+                f"{len(stats_df)} player-rows, {len(shots_df)} shots"
             )
             ok += 1
         except Exception as exc:
@@ -477,6 +531,10 @@ def main() -> int:
             season_path = ROOT / "season_all.csv"
             pd.read_csv(out_dir / "season_all.csv").to_csv(season_path, index=False)
             print(f"Copied season_all.csv → {season_path}")
+        if args.copy_season_to_root and n_stats:
+            stats_path = ROOT / "player_match_stats.csv"
+            pd.read_csv(out_dir / "player_match_stats.csv").to_csv(stats_path, index=False)
+            print(f"Copied player_match_stats.csv → {stats_path}")
 
     if failed:
         (out_dir / "failed.json").write_text(
