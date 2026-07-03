@@ -416,6 +416,12 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--consolidate", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--event-id",
+        type=int,
+        default=None,
+        help="Fetch only this match (use --list-only to find IDs)",
+    )
     parser.add_argument("--list-only", action="store_true")
     parser.add_argument(
         "--copy-season-to-root",
@@ -448,7 +454,12 @@ def main() -> int:
     client = TacosScoreClient(rate_limit_seconds=args.rate_limit)
     print(f"Listing matches · tournament={tournament_id} season={season_id} …")
     matches = list_finished_matches(client, tournament_id, season_id)
-    if args.limit:
+    if args.event_id is not None:
+        matches = [m for m in matches if m.event_id == args.event_id]
+        if not matches:
+            print(f"Event {args.event_id} not in finished matches for this season.", file=sys.stderr)
+            return 1
+    elif args.limit:
         matches = matches[: args.limit]
 
     meta = {
