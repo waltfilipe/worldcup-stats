@@ -16,7 +16,8 @@ Example::
         --url "https://www.sofascore.com/football/tournament/world/world-championship/16#id:58210" \\
         --consolidate --resume
 
-Run locally — Sofascore may return HTTP 403 from cloud IPs.
+Run locally — Sofascore may return HTTP 403 from cloud IPs or after heavy
+scraping. Use ``--proxy`` or env ``HTTPS_PROXY`` with a residential HTTPS proxy.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import re
 import sys
 import time
@@ -469,6 +471,27 @@ def _consolidate_glob(out_dir: Path, pattern: str, out_name: str) -> int:
     return len(all_df)
 
 
+def _resolve_proxies(proxy_url: str | None) -> dict[str, str] | None:
+    """Build tacoscore proxies dict from CLI flag or environment."""
+    url = (
+        proxy_url
+        or os.environ.get("TACOSCORE_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+    )
+    if not url:
+        return None
+    return {"https": url, "http": url}
+
+
+def _proxy_log_label(proxies: dict[str, str]) -> str:
+    """Host:port only — never print credentials."""
+    url = proxies.get("https", "")
+    if "@" in url:
+        return url.split("@", 1)[1]
+    return url
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Fetch SofaScore coordinates, player stats, and shots for a tournament."
@@ -485,6 +508,15 @@ def main() -> int:
         help="Action streams to export (default: passes ball-carries defensive)",
     )
     parser.add_argument("--rate-limit", type=float, default=0.4)
+    parser.add_argument(
+        "--proxy",
+        default=None,
+        metavar="URL",
+        help=(
+            "HTTPS proxy (e.g. http://user:pass@host:port). "
+            "Also reads TACOSCORE_PROXY or HTTPS_PROXY."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--consolidate", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
@@ -528,7 +560,10 @@ def main() -> int:
 
     import pandas as pd
 
-    client = TacosScoreClient(rate_limit_seconds=args.rate_limit)
+    proxies = _resolve_proxies(args.proxy)
+    if proxies:
+        print(f"Proxy enabled · {_proxy_log_label(proxies)}")
+    client = TacosScoreClient(rate_limit_seconds=args.rate_limit, proxies=proxies)
     print(f"Listing matches · tournament={tournament_id} season={season_id} …")
     matches = list_finished_matches(client, tournament_id, season_id)
     if args.event_id is not None:

@@ -4,12 +4,31 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+
+
+def _resolve_proxies(proxy_url: str | None) -> dict[str, str] | None:
+    url = (
+        proxy_url
+        or os.environ.get("TACOSCORE_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+    )
+    if not url:
+        return None
+    return {"https": url, "http": url}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Diagnose action coverage for one SofaScore event.")
     parser.add_argument("event_id", type=int)
+    parser.add_argument(
+        "--proxy",
+        default=None,
+        metavar="URL",
+        help="HTTPS proxy URL (or set TACOSCORE_PROXY / HTTPS_PROXY)",
+    )
     args = parser.parse_args()
 
     try:
@@ -18,7 +37,8 @@ def main() -> int:
         print("pip install -r requirements-sofascore.txt", file=sys.stderr)
         return 1
 
-    client = TacosScoreClient(rate_limit_seconds=0.4)
+    proxies = _resolve_proxies(args.proxy)
+    client = TacosScoreClient(rate_limit_seconds=0.4, proxies=proxies)
     eid = args.event_id
     match = client.fetch_full_match(eid)
 
