@@ -54,11 +54,13 @@ FIELD_X, FIELD_Y = 120.0, 80.0
 HALF_LINE_X = FIELD_X / 2
 FINAL_THIRD_LINE_X = 80.0
 GOAL_X, GOAL_Y = 120.0, 40.0
-FIG_W, FIG_H = 5.4, 3.5
-FIG_DPI = 160
-PASS_START_MARKER_SIZE = 6
-CARRY_START_MARKER_SIZE = 6
-MAP_REF_WIDTH = 5.4
+FIG_W, FIG_H = 7.2, 4.8
+FIG_DPI = 220
+PASS_START_MARKER_SIZE = 7
+CARRY_START_MARKER_SIZE = 7
+MAP_REF_WIDTH = 7.2
+PASS_DEST_HEATMAP_COLS = 12
+PASS_DEST_HEATMAP_ROWS = 6
 ARROW_WIDTH = 0.75
 ARROW_HEADWIDTH = 1.15
 ARROW_HEADLENGTH = 1.15
@@ -188,6 +190,13 @@ CMAP_PASS = LinearSegmentedColormap.from_list(
 CMAP_CARRY = LinearSegmentedColormap.from_list(
     "carry_dxt", ["#fde68a", "#fbbf24", "#f59e0b", "#b45309"]
 )
+CMAP_PASS_DEST = LinearSegmentedColormap.from_list(
+    "pass_dest", ["#1a1a2e", "#1e3a8a", "#3b82f6", "#fbbf24", "#ef4444"]
+)
+
+STAT_CARD_GENERAL_COLOR = "#3b82f6"
+STAT_CARD_IMPACT_COLOR = "#22c55e"
+STAT_CARD_XT_COLOR = "#a855f7"
 
 COLOR_SUCCESS = "#6ee7b7"
 COLOR_PROGRESSIVE = "#7dd3fc"
@@ -2358,6 +2367,72 @@ def draw_carry_map(df: pd.DataFrame, player_name: str, match_label: str, *, impa
     return _save_fig(fig), fig
 
 
+def draw_pass_destination_heatmap(df: pd.DataFrame, player_name: str, match_label: str):
+    """12×6 heatmap of pass end locations on the pitch."""
+    passes = df[(df["category"] == "passes") & df["has_end"]].copy()
+    fig, ax, pitch = _base_pitch()
+    scale = _map_scale()
+
+    x_bins = np.linspace(0.0, FIELD_X, PASS_DEST_HEATMAP_COLS + 1)
+    y_bins = np.linspace(0.0, FIELD_Y, PASS_DEST_HEATMAP_ROWS + 1)
+    grid = np.zeros((PASS_DEST_HEATMAP_ROWS, PASS_DEST_HEATMAP_COLS), dtype=float)
+
+    if not passes.empty:
+        x_idx = np.clip(
+            np.digitize(passes["x_end"].to_numpy(), x_bins, right=True) - 1,
+            0,
+            PASS_DEST_HEATMAP_COLS - 1,
+        )
+        y_idx = np.clip(
+            np.digitize(passes["y_end"].to_numpy(), y_bins, right=True) - 1,
+            0,
+            PASS_DEST_HEATMAP_ROWS - 1,
+        )
+        for ix, iy in zip(x_idx, y_idx):
+            grid[iy, ix] += 1.0
+
+    vmax = max(float(grid.max()), 1.0)
+    norm = Normalize(vmin=0.0, vmax=vmax)
+    threshold = vmax * 0.45
+
+    for iy in range(PASS_DEST_HEATMAP_ROWS):
+        for ix in range(PASS_DEST_HEATMAP_COLS):
+            value = float(grid[iy, ix])
+            x0, x1 = x_bins[ix], x_bins[ix + 1]
+            y0, y1 = y_bins[iy], y_bins[iy + 1]
+            ax.add_patch(
+                Rectangle(
+                    (x0, y0), x1 - x0, y1 - y0,
+                    facecolor=CMAP_PASS_DEST(norm(value)),
+                    edgecolor=(1, 1, 1, 0.22),
+                    linewidth=0.5,
+                    alpha=0.94,
+                    zorder=2,
+                )
+            )
+            if value > 0:
+                label = f"{int(value)}"
+                ax.text(
+                    (x0 + x1) / 2, (y0 + y1) / 2, label,
+                    ha="center", va="center",
+                    color="#000000" if value <= threshold else "#ffffff",
+                    fontsize=7.2 * scale, fontweight="600", zorder=4,
+                )
+
+    pitch.draw(ax=ax)
+    sm = plt.cm.ScalarMappable(cmap=CMAP_PASS_DEST, norm=norm)
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.022, pad=0.02, shrink=0.55)
+    cbar.ax.yaxis.set_tick_params(color="#ffffff", labelsize=6)
+    plt.setp(cbar.ax.axes.get_yticklabels(), color="#ffffff")
+    cbar.set_label("Passes", color="#c7cdda", fontsize=7 * scale)
+    ax.set_title(
+        f"{player_name}\nDestino dos passes · 12×6 · {match_label}",
+        color="white", fontsize=9.2 * scale, pad=5,
+    )
+    _attack_arrow(fig, has_cbar=True)
+    return _save_fig(fig), fig
+
+
 def draw_top_deltaxt_map(
     df: pd.DataFrame,
     player_name: str,
@@ -2559,6 +2634,17 @@ def _player_selector(key: str) -> dict:
     return options[name]
 
 
+def render_player_stats_cards(stats: dict) -> None:
+    """Render the three stat cards with distinct accent colors."""
+    stat_cols = st.columns(3)
+    with stat_cols[0]:
+        render_general_stats_card(stats, STAT_CARD_GENERAL_COLOR)
+    with stat_cols[1]:
+        render_impact_card(stats, STAT_CARD_IMPACT_COLOR)
+    with stat_cols[2]:
+        render_xt_efficiency_card(stats, STAT_CARD_XT_COLOR)
+
+
 def render_analysis_tab(
     player_data: dict[str, pd.DataFrame],
     *,
@@ -2584,40 +2670,28 @@ def render_analysis_tab(
             draw_impact_plays_map, df, player["name"], match_label,
             "Sem impact plays no recorte.",
         )
-        return
+    else:
+        map_cols = st.columns(3)
+        with map_cols[0]:
+            st.markdown('<div class="map-label">Passes</div>', unsafe_allow_html=True)
+            _show_map(draw_pass_map, df, player["name"], match_label, "Sem passes no recorte.")
+        with map_cols[1]:
+            st.markdown('<div class="map-label">Conduções</div>', unsafe_allow_html=True)
+            _show_map(draw_carry_map, df, player["name"], match_label, "Sem conduções no recorte.")
+        with map_cols[2]:
+            st.markdown('<div class="map-label">Destino dos passes</div>', unsafe_allow_html=True)
+            _show_map(
+                draw_pass_destination_heatmap, df, player["name"], match_label,
+                "Sem passes com destino no recorte.",
+            )
 
-    map_cols = st.columns(2)
-    with map_cols[0]:
-        st.markdown('<div class="map-label">Passes</div>', unsafe_allow_html=True)
-        _show_map(draw_pass_map, df, player["name"], match_label, "Sem passes no recorte.")
-    with map_cols[1]:
-        st.markdown('<div class="map-label">Conduções</div>', unsafe_allow_html=True)
-        _show_map(draw_carry_map, df, player["name"], match_label, "Sem conduções no recorte.")
-
-
-def render_stats_tab(player_data: dict[str, pd.DataFrame]) -> None:
-    player = _player_selector("stats_player")
+    st.markdown("---")
     st.markdown("### Estatísticas")
     st.caption(
         f"**{ALL_GAMES_LABEL.capitalize()}** · xT heurístico **v4** · "
         "Finalizações, xG, assistências e xA não constam nos CSVs Wyscout exportados."
     )
-
-    df = player_data[player["code"]]
-    st.markdown(
-        f'<div class="player-header">{player["name"]}</div>'
-        f'<div class="player-sub">{player["position"]}</div>',
-        unsafe_allow_html=True,
-    )
-
-    if df.empty:
-        st.warning(f"Sem dados para {player['name']}.")
-        return
-
-    stats = compute_player_stats(df)
-    render_general_stats_card(stats, player["tone"])
-    render_impact_card(stats, player["tone"])
-    render_xt_efficiency_card(stats, player["tone"])
+    render_player_stats_cards(compute_player_stats(df))
 
 
 def render_xt_model_comparison(
@@ -3241,15 +3315,12 @@ with st.sidebar:
     )
     st.caption("xT heurístico v4 · 5 jogadores · Stats agregadas")
 
-tab_analysis, tab_stats, tab_world_cup = st.tabs(
-    ["Análise", "Stats", "World Cup"]
+tab_analysis, tab_world_cup = st.tabs(
+    ["Análise", "World Cup"]
 )
 
 with tab_analysis:
     render_analysis_tab(player_data, impact_plays_only=impact_plays_only)
-
-with tab_stats:
-    render_stats_tab(player_data)
 
 with tab_world_cup:
     render_world_cup_tab(player_data)
