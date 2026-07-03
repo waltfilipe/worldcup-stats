@@ -67,10 +67,13 @@ ARROW_HEADLENGTH = 1.15
 ARROW_ALPHA = 0.68
 ARROW_ALPHA_EMPH = 0.82
 ALL_GAMES_LABEL = "todos os jogos"
-DATA_CACHE_VERSION = 35
+DATA_CACHE_VERSION = 36
 SEASON_ALL_CSV_PATH = Path(__file__).resolve().parent / "season_all.csv"
+PLAYER_MATCH_STATS_PATH = Path(__file__).resolve().parent / "player_match_stats.csv"
 MIN_WC_ACTIONS_DEFAULT = 50
 DEFAULT_PLAYER_POSITION = "CM"
+# SofaScore lineup codes (G/D/M/F) → short codes used in heuristic_scoring.py
+SOFASCORE_POSITION_MAP = {"G": "GK", "D": "CB", "M": "CM", "F": "ST"}
 PLAYER_TONE_PALETTE = (
     "#5b9bd5", "#e67e22", "#22c55e", "#9333ea", "#dc2626",
     "#14b8a6", "#f472b6", "#eab308", "#6366f1", "#84cc16",
@@ -1230,25 +1233,125 @@ def _frame_to_actions(frame: pd.DataFrame) -> pd.DataFrame:
     return enrich_with_xt_v3(out)
 
 
+def _normalize_player_position(raw: str | None) -> str:
+    """Map SofaScore G/D/M/F or full names to short position codes."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return DEFAULT_PLAYER_POSITION
+    text = str(raw).strip()
+    if not text:
+        return DEFAULT_PLAYER_POSITION
+    if text in SOFASCORE_POSITION_MAP:
+        return SOFASCORE_POSITION_MAP[text]
+    from heuristic_scoring import shorten_position
+
+    short = shorten_position(text)
+    return short if short != "—" else DEFAULT_PLAYER_POSITION
+
+
 def build_player_registry(frame: pd.DataFrame) -> list[dict]:
     """Build player entries for all players in the season dataset."""
+    work = frame.copy()
+    work["player_id"] = work["player_id"].astype(str)
+    if "position" in work.columns:
+        work["position"] = work["position"].map(_normalize_player_position)
+        pos_by_id = (
+            work.groupby("player_id", sort=False)["position"]
+            .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else DEFAULT_PLAYER_POSITION)
+            .to_dict()
+        )
+    else:
+        pos_by_id = {}
+
     players_df = (
-        frame[["player_id", "player_name"]]
+        work[["player_id", "player_name"]]
         .drop_duplicates()
         .sort_values("player_name", kind="stable")
         .reset_index(drop=True)
     )
     registry: list[dict] = []
     for idx, row in players_df.iterrows():
+        pid = str(row["player_id"])
         registry.append(
             {
-                "code": str(row["player_id"]),
+                "code": pid,
                 "name": str(row["player_name"]),
-                "position": DEFAULT_PLAYER_POSITION,
+                "position": pos_by_id.get(pid, DEFAULT_PLAYER_POSITION),
                 "tone": PLAYER_TONE_PALETTE[idx % len(PLAYER_TONE_PALETTE)],
             }
         )
     return registry
+
+
+@st.cache_data(show_spinner=False)
+def load_player_box_stats(_cache_version: int = DATA_CACHE_VERSION) -> dict[str, dict]:
+    """Season totals from SofaScore player_match_stats.csv (xG, xA, shots, …)."""
+    if not PLAYER_MATCH_STATS_PATH.exists():
+        return {}
+
+    stats = pd.read_csv(PLAYER_MATCH_STATS_PATH, low_memory=False)
+    if stats.empty or "player_id" not in stats.columns:
+        return {}
+
+    stats["player_id"] = stats["player_id"].astype(str)
+    numeric_cols = [
+        "total_shots",
+        "goals",
+        "goal_assist",
+        "expected_goals",
+        "expected_assists",
+        "rating",
+        "minutes_played",
+        "touches",
+    ]
+    for col in numeric_cols:
+        if col in stats.columns:
+            stats[col] = pd.to_numeric(stats[col], errors="coerce").fillna(0.0)
+
+    agg_spec: dict[str, tuple[str, str]] = {}
+    if "total_shots" in stats.columns:
+        agg_spec["shots"] = ("total_shots", "sum")
+    if "expected_goals" in stats.columns:
+        agg_spec["xg"] = ("expected_goals", "sum")
+    if "goal_assist" in stats.columns:
+        agg_spec["assists"] = ("goal_assist", "sum")
+    if "expected_assists" in stats.columns:
+        agg_spec["xa"] = ("expected_assists", "sum")
+    if "goals" in stats.columns:
+        agg_spec["goals"] = ("goals", "sum")
+    if "rating" in stats.columns:
+        agg_spec["rating"] = ("rating", "mean")
+    if "minutes_played" in stats.columns:
+        agg_spec["minutes"] = ("minutes_played", "sum")
+    if not agg_spec:
+        return {}
+
+    grouped = stats.groupby("player_id", sort=False).agg(**agg_spec)
+    out: dict[str, dict] = {}
+    for pid, row in grouped.iterrows():
+        entry = {k: (int(v) if k in ("shots", "assists", "goals", "minutes") else float(v)) for k, v in row.items()}
+        out[str(pid)] = entry
+    return out
+
+
+def _merge_box_stats(stats: dict, player_code: str, box_stats: dict[str, dict]) -> dict:
+    """Overlay SofaScore box-score totals onto action-derived stats."""
+    extra = box_stats.get(player_code)
+    if not extra:
+        return stats
+    merged = dict(stats)
+    if "shots" in extra:
+        merged["shots"] = extra["shots"]
+    if "xg" in extra:
+        merged["xg"] = round(extra["xg"], 3)
+    if "assists" in extra:
+        merged["assists"] = extra["assists"]
+    if "xa" in extra:
+        merged["xa"] = round(extra["xa"], 3)
+    if "goals" in extra:
+        merged["goals"] = extra["goals"]
+    if "rating" in extra:
+        merged["rating"] = round(extra["rating"], 2)
+    return merged
 
 
 @st.cache_data(show_spinner="Carregando season_all.csv…")
@@ -1259,8 +1362,8 @@ def load_season_dataset(
         return [], {}
 
     frame = pd.read_csv(SEASON_ALL_CSV_PATH, low_memory=False)
+    registry = build_player_registry(frame)
     actions = _frame_to_actions(frame)
-    registry = build_player_registry(actions)
     player_data: dict[str, pd.DataFrame] = {}
     for player in registry:
         code = player["code"]
@@ -2773,11 +2876,21 @@ def render_analysis_tab(
 
     st.markdown("---")
     st.markdown("#### Estatísticas")
-    st.caption(
-        f"**{ALL_GAMES_LABEL.capitalize()}** · xT heurístico **v4** · "
-        "Finalizações, xG, assistências e xA não constam nos CSVs Wyscout."
-    )
-    render_player_stats_cards(compute_player_stats(df))
+    box_stats = load_player_box_stats()
+    has_box = player["code"] in box_stats
+    if has_box:
+        st.caption(
+            f"**{ALL_GAMES_LABEL.capitalize()}** · xT heurístico **v4** · "
+            "Finalizações, xG, assistências e xA do SofaScore (`player_match_stats.csv`)."
+        )
+    else:
+        st.caption(
+            f"**{ALL_GAMES_LABEL.capitalize()}** · xT heurístico **v4** · "
+            "Finalizações, xG, assistências e xA requerem `player_match_stats.csv` "
+            "(rode `scripts/fetch_sofascore_season.py --consolidate`)."
+        )
+    stats = _merge_box_stats(compute_player_stats(df), player["code"], box_stats)
+    render_player_stats_cards(stats)
 
 
 def render_xt_model_comparison(
