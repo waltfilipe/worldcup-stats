@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .streamlit/
+# Legacy per-player exports (superseded by season_all.csv)
+*-vs *.csv
+enzo.csv

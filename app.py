@@ -67,7 +67,14 @@ ARROW_HEADLENGTH = 1.15
 ARROW_ALPHA = 0.68
 ARROW_ALPHA_EMPH = 0.82
 ALL_GAMES_LABEL = "todos os jogos"
-DATA_CACHE_VERSION = 34
+DATA_CACHE_VERSION = 35
+SEASON_ALL_CSV_PATH = Path(__file__).resolve().parent / "season_all.csv"
+MIN_WC_ACTIONS_DEFAULT = 50
+DEFAULT_PLAYER_POSITION = "CM"
+PLAYER_TONE_PALETTE = (
+    "#5b9bd5", "#e67e22", "#22c55e", "#9333ea", "#dc2626",
+    "#14b8a6", "#f472b6", "#eab308", "#6366f1", "#84cc16",
+)
 XT_ZONE_COLS = 3
 XT_ZONE_ROWS = 2
 NX_XT = 16
@@ -174,16 +181,6 @@ CARD_INNER_BORDER = "rgba(107,114,128,0.45)"
 TOP_DELTAXT_N = 10
 IMPACT_PASS_MIN_GOAL_APPROACH_FINAL_THIRD = 5.0
 IMPACT_PASS_MIN_GOAL_APPROACH_REST = 10.0
-EXCLUDED_CSV = {"enzo.csv"}
-CSV_X_FLIP_MATCHES = frozenset({"Uruguay"})
-
-PLAYERS = [
-    {"code": "BG", "name": "Bruno Guimarães", "position": "CM", "tone": "#5b9bd5", "glob": "BG-vs *.csv"},
-    {"code": "CS", "name": "Casemiro", "position": "DM", "tone": "#e67e22", "glob": "CS-vs *.csv"},
-    {"code": "LP", "name": "Lucas Paquetá", "position": "AM", "tone": "#22c55e", "glob": "LP-vs *.csv"},
-    {"code": "PD", "name": "Pedri", "position": "CM", "tone": "#9333ea", "glob": "Pedri-vs *.csv"},
-    {"code": "RD", "name": "Rodri", "position": "DM", "tone": "#dc2626", "glob": "Rodri-vs *.csv"},
-]
 
 CMAP_PASS = LinearSegmentedColormap.from_list(
     "pass_dxt", ["#bfdbfe", "#60a5fa", "#2563eb", "#1e3a8a"]
@@ -1153,86 +1150,129 @@ def _safe_col_sum(df: pd.DataFrame, col: str) -> float:
     return float(pd.to_numeric(df[col], errors="coerce").fillna(0.0).sum())
 
 
-# ── DATA LOADING ─────────────────────────────────────────────
-def discover_csv_files(base_dir: Path | None = None) -> list[Path]:
-    root = base_dir or Path(__file__).resolve().parent
-    return sorted(
-        p for p in root.glob("*.csv")
-        if p.name not in EXCLUDED_CSV
-    )
+def _parse_bool_series(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip().str.lower().isin({"true", "1", "yes", "successful"})
 
 
-def _match_slug_from_csv(path: Path) -> str:
-    stem = path.stem
-    if "-vs " in stem:
-        return stem.split("-vs ", 1)[1]
-    return stem
+def _wyscout_to_statsbomb_vec(
+    x: pd.Series | np.ndarray,
+    y: pd.Series | np.ndarray,
+    flip_x: pd.Series | np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    flip = np.asarray(flip_x, dtype=bool)
+    x_sb = x_arr * FIELD_X / WYSCOUT_PITCH_SIZE
+    y_sb = FIELD_Y - (y_arr * FIELD_Y / WYSCOUT_PITCH_SIZE)
+    x_sb = np.where(flip, FIELD_X - x_sb, x_sb)
+    return x_sb, y_sb
 
 
-def _csv_needs_x_flip(path: Path) -> bool:
-    return _match_slug_from_csv(path) in CSV_X_FLIP_MATCHES
-
-
-def load_player_csv(path: Path, *, flip_x: bool = False) -> pd.DataFrame:
-    frame = pd.read_csv(path)
-    required = {"category", "eventActionType", "start_x", "start_y"}
+def _frame_to_actions(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert season_all.csv rows to the internal action schema."""
+    required = {
+        "category", "eventActionType", "start_x", "start_y",
+        "player_id", "player_name", "isHome",
+    }
     missing = required - set(frame.columns)
     if missing:
-        raise ValueError(f"Colunas ausentes em {path.name}: {', '.join(sorted(missing))}")
+        raise ValueError(f"Colunas ausentes em {SEASON_ALL_CSV_PATH.name}: {', '.join(sorted(missing))}")
 
-    rows = []
-
-    for idx, row in frame.iterrows():
-        sx, sy = wyscout_to_statsbomb(
-            float(row["start_x"]), float(row["start_y"]), flip_x=flip_x
+    is_home = _parse_bool_series(frame["isHome"])
+    # Wyscout exports in season_all.csv are already player-oriented; no x-flip needed.
+    flip_x = pd.Series(False, index=frame.index)
+    sx, sy = _wyscout_to_statsbomb_vec(frame["start_x"], frame["start_y"], flip_x)
+    has_end = frame["end_x"].notna() & frame["end_y"].notna()
+    ex = np.full(len(frame), np.nan)
+    ey = np.full(len(frame), np.nan)
+    if has_end.any():
+        ex_vals, ey_vals = _wyscout_to_statsbomb_vec(
+            frame.loc[has_end, "end_x"],
+            frame.loc[has_end, "end_y"],
+            flip_x.loc[has_end],
         )
-        has_end = _has_coords(row, "end")
-        ex = ey = np.nan
-        if has_end:
-            ex, ey = wyscout_to_statsbomb(
-                float(row["end_x"]), float(row["end_y"]), flip_x=flip_x
-            )
+        ex[has_end.to_numpy()] = ex_vals
+        ey[has_end.to_numpy()] = ey_vals
 
-        rows.append(
+    home_team = frame.get("home_team", pd.Series("", index=frame.index)).fillna("").astype(str)
+    away_team = frame.get("away_team", pd.Series("", index=frame.index)).fillna("").astype(str)
+    match = np.where(
+        (home_team != "") & (away_team != ""),
+        home_team + " vs " + away_team,
+        frame.get("event_id", pd.Series("", index=frame.index)).astype(str),
+    )
+
+    out = pd.DataFrame(
+        {
+            "category": frame["category"].astype(str).str.strip().str.lower(),
+            "action_type": frame["eventActionType"].astype(str).str.strip().str.lower(),
+            "is_home": is_home,
+            "is_success": _parse_bool_series(frame["outcome"]) if "outcome" in frame.columns else False,
+            "is_key_pass": _parse_bool_series(frame["keypass"]) if "keypass" in frame.columns else False,
+            "is_long_ball": _parse_bool_series(frame["isLongBall"]) if "isLongBall" in frame.columns else False,
+            "x_start": sx,
+            "y_start": sy,
+            "x_end": ex,
+            "y_end": ey,
+            "has_end": has_end,
+            "player": frame["player_name"].astype(str),
+            "player_id": frame["player_id"].astype(str),
+            "player_name": frame["player_name"].astype(str),
+            "match": match,
+            "event_id": frame["event_id"].astype(str) if "event_id" in frame.columns else "",
+            "home_team": home_team,
+            "away_team": away_team,
+            "match_date": frame["match_date"].astype(str) if "match_date" in frame.columns else "",
+            "source_file": SEASON_ALL_CSV_PATH.name,
+            "row_id": np.arange(1, len(frame) + 1),
+        }
+    )
+    return enrich_with_xt_v3(out)
+
+
+def build_player_registry(frame: pd.DataFrame) -> list[dict]:
+    """Build player entries for all players in the season dataset."""
+    players_df = (
+        frame[["player_id", "player_name"]]
+        .drop_duplicates()
+        .sort_values("player_name", kind="stable")
+        .reset_index(drop=True)
+    )
+    registry: list[dict] = []
+    for idx, row in players_df.iterrows():
+        registry.append(
             {
-                "category": str(row["category"]).strip().lower(),
-                "action_type": str(row["eventActionType"]).strip().lower(),
-                "is_home": _parse_bool(row.get("isHome")),
-                "is_success": _parse_bool(row.get("outcome")),
-                "is_key_pass": _parse_bool(row.get("keypass")),
-                "is_long_ball": _parse_bool(row.get("isLongBall")),
-                "x_start": sx,
-                "y_start": sy,
-                "x_end": ex,
-                "y_end": ey,
-                "has_end": has_end,
-                "player": path.stem.replace("_", " ").title(),
-                "source_file": path.name,
-                "row_id": idx + 1,
+                "code": str(row["player_id"]),
+                "name": str(row["player_name"]),
+                "position": DEFAULT_PLAYER_POSITION,
+                "tone": PLAYER_TONE_PALETTE[idx % len(PLAYER_TONE_PALETTE)],
             }
         )
+    return registry
 
-    return enrich_with_xt_v3(pd.DataFrame(rows))
+
+@st.cache_data(show_spinner="Carregando season_all.csv…")
+def load_season_dataset(
+    _cache_version: int = DATA_CACHE_VERSION,
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    if not SEASON_ALL_CSV_PATH.exists():
+        return [], {}
+
+    frame = pd.read_csv(SEASON_ALL_CSV_PATH, low_memory=False)
+    actions = _frame_to_actions(frame)
+    registry = build_player_registry(actions)
+    player_data: dict[str, pd.DataFrame] = {}
+    for player in registry:
+        code = player["code"]
+        subset = actions[actions["player_id"] == code].copy()
+        subset["player"] = player["name"]
+        player_data[code] = subset
+    return registry, player_data
 
 
-def load_player_all_matches(player: dict, base_dir: Path | None = None) -> pd.DataFrame:
-    """Aggregate all match CSVs for a player entry in PLAYERS."""
-    root = base_dir or Path(__file__).resolve().parent
-    pattern = player.get("glob", f"{player['code']}-vs *.csv")
-    files = sorted(root.glob(pattern))
-    if not files:
-        return pd.DataFrame()
-
-    frames = []
-    for path in files:
-        flip_x = _csv_needs_x_flip(path)
-        match_df = load_player_csv(path, flip_x=flip_x)
-        match_df["match"] = _match_slug_from_csv(path)
-        frames.append(match_df)
-
-    combined = pd.concat(frames, ignore_index=True)
-    combined["player"] = player["name"]
-    return combined
+def load_all_players(_cache_version: int = DATA_CACHE_VERSION) -> dict[str, pd.DataFrame]:
+    _, player_data = load_season_dataset(_cache_version)
+    return player_data
 
 
 def top_deltaxt_actions(
@@ -1907,30 +1947,55 @@ def _wc_player_metrics(player_data: dict[str, pd.DataFrame], player: dict) -> di
     }
 
 
-def _build_wc_players(player_data: dict[str, pd.DataFrame]) -> list[dict]:
+def _build_wc_players(
+    player_data: dict[str, pd.DataFrame],
+    players_registry: list[dict],
+    *,
+    min_actions: int = 0,
+) -> list[dict]:
     players: list[dict] = []
-    for player in PLAYERS:
+    for player in players_registry:
         metrics = _wc_player_metrics(player_data, player)
-        if metrics is not None:
-            players.append(metrics)
+        if metrics is None:
+            continue
+        if metrics.get("total_actions", 0) < min_actions:
+            continue
+        players.append(metrics)
     players.sort(key=lambda p: p.get("sum_delta_xt", 0.0), reverse=True)
     return players
 
 
-def render_world_cup_tab(player_data: dict[str, pd.DataFrame]) -> None:
-    """World Cup squad — scatter charts and rankings under heuristic v4."""
+def render_world_cup_tab(
+    player_data: dict[str, pd.DataFrame],
+    players_registry: list[dict],
+) -> None:
+    """Full World Cup player pool — scatter charts and rankings under heuristic v4."""
     st.markdown("### Copa do Mundo · Heurístico v4")
     st.caption(
-        "Comparação da seleção brasileira nos jogos exportados (CSVs Wyscout), "
-        "com métricas agregadas pelo modelo **heurístico v4** (v3.1 + bônus Top5 no último terço)."
+        "Todos os jogadores da Copa no `season_all.csv`, com métricas agregadas pelo "
+        "modelo **heurístico v4** (v3.1 + bônus Top5 no último terço)."
     )
 
-    players = _laliga_prepare_players(_build_wc_players(player_data))
+    min_actions = st.slider(
+        "Mínimo de ações (passes + conduções)",
+        min_value=0,
+        max_value=300,
+        value=MIN_WC_ACTIONS_DEFAULT,
+        step=10,
+        help="Filtra jogadores com pouco volume na Copa para os gráficos e tabelas.",
+    )
+
+    players = _laliga_prepare_players(
+        _build_wc_players(player_data, players_registry, min_actions=min_actions)
+    )
     if not players:
         st.warning("Nenhum jogador com dados disponíveis.")
         return
 
-    st.caption(f"{len(players)} jogadores · todos os jogos agregados")
+    st.caption(
+        f"{len(players)} jogadores · {len(players_registry)} no dataset · "
+        f"mín. {min_actions} ações"
+    )
 
     with st.expander("Guia de métricas · passes vs conduções", expanded=False):
         st.markdown(
@@ -1952,7 +2017,7 @@ def render_world_cup_tab(player_data: dict[str, pd.DataFrame]) -> None:
             """
         )
 
-    scatter_title = "Seleção Brasileira · Copa do Mundo"
+    scatter_title = "Copa do Mundo · todos os jogadores"
     st.markdown("#### Gráficos de dispersão")
     selected_groups = st.multiselect(
         "Filtrar grupos de posição nos gráficos",
@@ -2616,14 +2681,6 @@ def zone_xt_means(grid: np.ndarray, n_x: int = XT_ZONE_COLS, n_y: int = XT_ZONE_
     return zones
 
 
-@st.cache_data(show_spinner=False)
-def load_all_players(_cache_version: int = DATA_CACHE_VERSION) -> dict[str, pd.DataFrame]:
-    return {
-        player["code"]: load_player_all_matches(player)
-        for player in PLAYERS
-    }
-
-
 def _show_map(
     draw_fn,
     df: pd.DataFrame,
@@ -2640,11 +2697,25 @@ def _show_map(
     st.image(img, use_container_width=True)
 
 
-def _player_selector(key: str) -> dict:
-    """Sidebar-style player picker shared by Análise and Stats tabs."""
-    options = {p["name"]: p for p in PLAYERS}
-    name = st.selectbox("Jogador", list(options.keys()), key=key)
-    return options[name]
+def _player_selector(key: str, players_registry: list[dict]) -> dict:
+    """Searchable player picker for the full World Cup dataset."""
+    search = st.text_input(
+        "Buscar jogador",
+        "",
+        key=f"{key}_search",
+        placeholder="Digite parte do nome…",
+    )
+    filtered = players_registry
+    if search.strip():
+        query = search.strip().lower()
+        filtered = [p for p in players_registry if query in p["name"].lower()]
+    filtered = sorted(filtered, key=lambda p: p["name"])
+    if not filtered:
+        st.warning("Nenhum jogador encontrado para essa busca.")
+        st.stop()
+    labels = [p["name"] for p in filtered]
+    name = st.selectbox("Jogador", labels, key=key)
+    return next(p for p in filtered if p["name"] == name)
 
 
 def render_player_stats_cards(stats: dict) -> None:
@@ -2660,10 +2731,11 @@ def render_player_stats_cards(stats: dict) -> None:
 
 def render_analysis_tab(
     player_data: dict[str, pd.DataFrame],
+    players_registry: list[dict],
     *,
     impact_plays_only: bool = False,
 ) -> None:
-    player = _player_selector("analysis_player")
+    player = _player_selector("analysis_player", players_registry)
     match_label = ALL_GAMES_LABEL
     df = player_data[player["code"]]
 
@@ -3289,22 +3361,22 @@ st.markdown(
     <div style="text-align:center;margin-bottom:1rem;">
       <h1 style="margin:0;color:#eef1f7;">World Cup Stats</h1>
       <p style="color:#94a3b8;font-size:0.95rem;margin-top:0.35rem;">
-        Bruno Guimarães · Casemiro · Lucas Paquetá · Pedri · Rodri — xT Heurístico v4
+        Copa do Mundo · todos os jogadores · xT Heurístico v4
       </p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+players_registry, raw_player_data = load_season_dataset()
 player_data = {
     code: ensure_xt_model_columns(df)
-    for code, df in load_all_players().items()
+    for code, df in raw_player_data.items()
 }
-if not any(not df.empty for df in player_data.values()):
+if not players_registry or not any(not df.empty for df in player_data.values()):
     st.error(
-        "Nenhum CSV de jogador encontrado. "
-        "Esperado: `BG-vs *.csv`, `CS-vs *.csv`, `LP-vs *.csv`, "
-        "`Pedri-vs *.csv`, `Rodri-vs *.csv`."
+        "Dataset da Copa não encontrado ou vazio. "
+        f"Esperado: `{SEASON_ALL_CSV_PATH.name}` na raiz do projeto."
     )
     st.stop()
 
@@ -3318,23 +3390,30 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+    st.caption(
+        f"{len(players_registry)} jogadores · "
+        f"{sum(len(df) for df in player_data.values()):,} ações · xT v4"
+    )
     st.markdown("---")
     impact_plays_only = st.checkbox(
         "Apenas impact plays nos mapas",
         value=False,
         help=(
-            "Mostra um mapa unificado só com passes certos de impacto "
-            "(aproximação ao gol + xT v4) e conduções de impacto."
+            "Filtra passes e conduções de impacto nos três mapas "
+            "(aproximação ao gol + xT v4)."
         ),
     )
-    st.caption("xT heurístico v4 · 5 jogadores · Stats agregadas")
 
 tab_analysis, tab_world_cup = st.tabs(
     ["Análise", "World Cup"]
 )
 
 with tab_analysis:
-    render_analysis_tab(player_data, impact_plays_only=impact_plays_only)
+    render_analysis_tab(
+        player_data,
+        players_registry,
+        impact_plays_only=impact_plays_only,
+    )
 
 with tab_world_cup:
-    render_world_cup_tab(player_data)
+    render_world_cup_tab(player_data, players_registry)
