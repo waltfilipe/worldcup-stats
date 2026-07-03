@@ -1,6 +1,7 @@
 from io import BytesIO
 import json
 from pathlib import Path
+import sys
 
 import matplotlib
 
@@ -14,6 +15,10 @@ from matplotlib.patches import FancyArrowPatch, Rectangle
 from matplotlib.colors import LinearSegmentedColormap, Normalize
 from mplsoccer import Pitch
 from PIL import Image
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from external_models import load_markov_model
 from heuristic_scoring import POSITION_GROUPS_ORDER, GROUP_COLORS, is_outfield_position, position_group

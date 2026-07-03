@@ -32,11 +32,19 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUT = ROOT / "data" / "sofascore"
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for _path in (SCRIPT_DIR, ROOT):
+    _s = str(_path)
+    if _s not in sys.path:
+        sys.path.insert(0, _s)
 
-from sofascore_positions import normalize_sofascore_position, resolve_match_positions
+try:
+    from sofascore_positions import normalize_sofascore_position, resolve_match_positions
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "Missing scripts/sofascore_positions.py — keep it next to fetch_sofascore_season.py."
+    ) from exc
 
 # Wyscout-style action export (compatible with app.py)
 ACTION_COLUMNS = [

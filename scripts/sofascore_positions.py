@@ -88,7 +88,6 @@ def _assign_by_lateral_order(
         return {}
     ordered = sorted(player_ids, key=lambda pid: mean_y.get(pid, 50.0))
     if len(ordered) != len(template):
-        # Mismatch (subs mixed in, odd formation) — fall back to generic CB/CM/ST
         fallback = {"D": "CB", "M": "CM", "F": "ST", "G": "GK"}
         coarse = template[0][:1] if template else "M"
         generic = fallback.get(coarse, "CM")
@@ -126,22 +125,22 @@ def infer_coarse_positions(
     for pid in by_coarse["G"]:
         resolved[pid] = "GK"
 
-    for pid, positions in (
+    for coarse_key, positions in (
         ("D", DEF_LINE_BY_COUNT),
         ("M", MID_LINE_BY_COUNT),
         ("F", FWD_LINE_BY_COUNT),
     ):
-        ids = by_coarse[pid]
+        ids = by_coarse[coarse_key]
         if not ids:
             continue
-        if pid == "F" and len(ids) == 2:
+        if coarse_key == "F" and len(ids) == 2:
             resolved.update(_infer_two_forwards(ids, mean_y_by_player))
             continue
         template = positions.get(len(ids))
         if template:
             resolved.update(_assign_by_lateral_order(ids, mean_y_by_player, template))
         else:
-            generic = {"D": "CB", "M": "CM", "F": "ST"}[pid]
+            generic = {"D": "CB", "M": "CM", "F": "ST"}[coarse_key]
             resolved.update({player_id: generic for player_id in ids})
 
     return resolved
