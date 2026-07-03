@@ -59,8 +59,8 @@ FIG_DPI = 220
 PASS_START_MARKER_SIZE = 7
 CARRY_START_MARKER_SIZE = 7
 MAP_REF_WIDTH = 7.2
-PASS_DEST_HEATMAP_COLS = 12
-PASS_DEST_HEATMAP_ROWS = 6
+PASS_DEST_HEATMAP_COLS = 6
+PASS_DEST_HEATMAP_ROWS = 4
 ARROW_WIDTH = 0.75
 ARROW_HEADWIDTH = 1.15
 ARROW_HEADLENGTH = 1.15
@@ -167,8 +167,9 @@ XT_V41_SURFACE_MAX = XT_V3_SURFACE_MAX
 # Modelo ativo para stats, impact plays e mapas de análise
 XT_PRIMARY_VARIANT = "v4"
 
-CARD_TITLE_TEXT = "14px"
-CARD_LABEL_TEXT = "16px"
+CARD_TITLE_TEXT = "11px"
+CARD_LABEL_TEXT = "12px"
+CARD_VALUE_TEXT = "18px"
 CARD_INNER_BORDER = "rgba(107,114,128,0.45)"
 TOP_DELTAXT_N = 10
 IMPACT_PASS_MIN_GOAL_APPROACH_FINAL_THIRD = 5.0
@@ -2003,7 +2004,7 @@ def render_world_cup_tab(player_data: dict[str, pd.DataFrame]) -> None:
 
 
 def _item_sep(idx: int, total: int) -> str:
-    return "" if idx == total - 1 else f"margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid {CARD_INNER_BORDER};"
+    return "" if idx == total - 1 else f"margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid {CARD_INNER_BORDER};"
 
 
 def _accent_rgb(border_color: str) -> tuple[int, int, int]:
@@ -2019,10 +2020,10 @@ def _stats_card_shell_html(title: str, border_color: str, body_html: str) -> str
     )
     html = (
         f'<div style="background:{grad};border:1px solid rgba({r},{g},{b},0.55);'
-        f'border-radius:14px;padding:18px 20px 14px 20px;margin-bottom:12px;">'
+        f'border-radius:10px;padding:12px 14px 10px 14px;margin-bottom:8px;">'
     )
     html += (
-        f'<div style="border-bottom:2.5px solid rgb({r},{g},{b});padding-bottom:8px;margin-bottom:12px;">'
+        f'<div style="border-bottom:2px solid rgb({r},{g},{b});padding-bottom:6px;margin-bottom:8px;">'
         f'<span style="font-size:{CARD_TITLE_TEXT};color:#eef1f7;font-weight:700;letter-spacing:0.04em;">'
         f"{title.upper()}</span></div>"
     )
@@ -2038,7 +2039,7 @@ def _simple_body_scoreboard(items: list[tuple[str, str]]) -> str:
         body += (
             '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;">'
             f'<span style="font-size:{CARD_LABEL_TEXT};color:#c7cdda;font-weight:600;">{label}</span>'
-            f'<span style="font-size:28px;color:#ffffff;font-weight:700;line-height:1;">{disp_val}</span>'
+            f'<span style="font-size:{CARD_VALUE_TEXT};color:#ffffff;font-weight:700;line-height:1;">{disp_val}</span>'
             "</div>"
         )
         body += "</div>"
@@ -2367,9 +2368,13 @@ def draw_carry_map(df: pd.DataFrame, player_name: str, match_label: str, *, impa
     return _save_fig(fig), fig
 
 
-def draw_pass_destination_heatmap(df: pd.DataFrame, player_name: str, match_label: str):
-    """12×6 heatmap of pass end locations on the pitch."""
+def draw_pass_destination_heatmap(
+    df: pd.DataFrame, player_name: str, match_label: str, *, impact_only: bool = False,
+):
+    """6×4 heatmap of pass end locations on the pitch."""
     passes = df[(df["category"] == "passes") & df["has_end"]].copy()
+    if impact_only:
+        passes = passes[passes["impact_pass"].astype(bool)]
     fig, ax, pitch = _base_pitch()
     scale = _map_scale()
 
@@ -2425,8 +2430,9 @@ def draw_pass_destination_heatmap(df: pd.DataFrame, player_name: str, match_labe
     cbar.ax.yaxis.set_tick_params(color="#ffffff", labelsize=6)
     plt.setp(cbar.ax.axes.get_yticklabels(), color="#ffffff")
     cbar.set_label("Passes", color="#c7cdda", fontsize=7 * scale)
+    title_suffix = " · Impact" if impact_only else ""
     ax.set_title(
-        f"{player_name}\nDestino dos passes · 12×6 · {match_label}",
+        f"{player_name}\nDestino dos passes · 6×4{title_suffix} · {match_label}",
         color="white", fontsize=9.2 * scale, pad=5,
     )
     _attack_arrow(fig, has_cbar=True)
@@ -2618,11 +2624,18 @@ def load_all_players(_cache_version: int = DATA_CACHE_VERSION) -> dict[str, pd.D
     }
 
 
-def _show_map(draw_fn, df: pd.DataFrame, player_name: str, match_label: str, empty_msg: str) -> None:
+def _show_map(
+    draw_fn,
+    df: pd.DataFrame,
+    player_name: str,
+    match_label: str,
+    empty_msg: str,
+    **draw_kwargs,
+) -> None:
     if df.empty:
         st.info(empty_msg)
         return
-    img, fig = draw_fn(df, player_name, match_label)
+    img, fig = draw_fn(df, player_name, match_label, **draw_kwargs)
     plt.close(fig)
     st.image(img, use_container_width=True)
 
@@ -2664,32 +2677,33 @@ def render_analysis_tab(
         st.warning(f"Sem dados para {player['name']}.")
         return
 
-    if impact_plays_only:
-        st.markdown('<div class="map-label">Impact Plays</div>', unsafe_allow_html=True)
+    map_kwargs = {"impact_only": impact_plays_only}
+    label_suffix = " · Impact" if impact_plays_only else ""
+    map_cols = st.columns(3)
+    with map_cols[0]:
+        st.markdown(f'<div class="map-label">Passes{label_suffix}</div>', unsafe_allow_html=True)
         _show_map(
-            draw_impact_plays_map, df, player["name"], match_label,
-            "Sem impact plays no recorte.",
+            draw_pass_map, df, player["name"], match_label,
+            "Sem passes no recorte.", **map_kwargs,
         )
-    else:
-        map_cols = st.columns(3)
-        with map_cols[0]:
-            st.markdown('<div class="map-label">Passes</div>', unsafe_allow_html=True)
-            _show_map(draw_pass_map, df, player["name"], match_label, "Sem passes no recorte.")
-        with map_cols[1]:
-            st.markdown('<div class="map-label">Conduções</div>', unsafe_allow_html=True)
-            _show_map(draw_carry_map, df, player["name"], match_label, "Sem conduções no recorte.")
-        with map_cols[2]:
-            st.markdown('<div class="map-label">Destino dos passes</div>', unsafe_allow_html=True)
-            _show_map(
-                draw_pass_destination_heatmap, df, player["name"], match_label,
-                "Sem passes com destino no recorte.",
-            )
+    with map_cols[1]:
+        st.markdown(f'<div class="map-label">Conduções{label_suffix}</div>', unsafe_allow_html=True)
+        _show_map(
+            draw_carry_map, df, player["name"], match_label,
+            "Sem conduções no recorte.", **map_kwargs,
+        )
+    with map_cols[2]:
+        st.markdown(f'<div class="map-label">Destino dos passes{label_suffix}</div>', unsafe_allow_html=True)
+        _show_map(
+            draw_pass_destination_heatmap, df, player["name"], match_label,
+            "Sem passes com destino no recorte.", **map_kwargs,
+        )
 
     st.markdown("---")
-    st.markdown("### Estatísticas")
+    st.markdown("#### Estatísticas")
     st.caption(
         f"**{ALL_GAMES_LABEL.capitalize()}** · xT heurístico **v4** · "
-        "Finalizações, xG, assistências e xA não constam nos CSVs Wyscout exportados."
+        "Finalizações, xG, assistências e xA não constam nos CSVs Wyscout."
     )
     render_player_stats_cards(compute_player_stats(df))
 
