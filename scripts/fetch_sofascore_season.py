@@ -348,11 +348,63 @@ def _shot_rows(
     return rows
 
 
+def _count_action_stream(actions) -> int:
+    if not actions:
+        return 0
+    return len(actions.passes) + len(actions.ball_carries) + len(actions.dribbles) + len(actions.defensive)
+
+
+def _action_coverage(match) -> tuple[int, int]:
+    """Players with rating-breakdown data vs players in player_data."""
+    total = len(match.player_data)
+    with_actions = sum(
+        1 for pdata in match.player_data.values() if _count_action_stream(pdata.actions) > 0
+    )
+    return with_actions, total
+
+
+def _heatmap_rows(
+    match,
+    *,
+    name_by_id: dict[int, str],
+    position_by_id: dict[int, str],
+) -> list[dict]:
+    """Touch locations when rating-breakdown is unavailable (e.g. Brasileirão)."""
+    meta = _match_meta(match)
+    rows: list[dict] = []
+    for pid, pdata in match.player_data.items():
+        if not pdata.heatmap or not pdata.heatmap.points:
+            continue
+        player_name = name_by_id.get(pid, str(pid))
+        position = position_by_id.get(pid, "")
+        for pt in pdata.heatmap.points:
+            rows.append(
+                {
+                    "category": "heatmap-touches",
+                    "eventActionType": "touch",
+                    "isHome": "",
+                    "outcome": True,
+                    "keypass": False,
+                    "isLongBall": "",
+                    "start_x": pt.x,
+                    "start_y": pt.y,
+                    "end_x": None,
+                    "end_y": None,
+                    "player_id": pid,
+                    "player_name": player_name,
+                    "position": position,
+                    **meta,
+                }
+            )
+    return rows
+
+
 def fetch_match_export(
     client,
     event_id: int,
     *,
     categories: set[str],
+    heatmap_fallback: bool = False,
 ) -> dict[str, list[dict]]:
     """Fetch one match and return actions, player stats, and shots."""
     match = client.fetch_full_match(event_id)
@@ -364,19 +416,30 @@ def fetch_match_export(
         entry.player.id: entry.position_match or entry.player.position or ""
         for entry in match.lineups.all_players()
     }
+    actions = _action_rows(
+        match,
+        categories=categories,
+        name_by_id=name_by_id,
+        position_by_id=position_by_id,
+    )
+    used_heatmap_fallback = False
+    if not actions and heatmap_fallback:
+        actions = _heatmap_rows(
+            match, name_by_id=name_by_id, position_by_id=position_by_id
+        )
+        used_heatmap_fallback = bool(actions)
+
+    with_actions, total_players = _action_coverage(match)
     return {
-        "actions": _action_rows(
-            match,
-            categories=categories,
-            name_by_id=name_by_id,
-            position_by_id=position_by_id,
-        ),
+        "actions": actions,
         "player_stats": _player_stats_rows(
             match,
             position_by_id=position_by_id,
             raw_position_by_id=raw_position_by_id,
         ),
         "shots": _shot_rows(match, name_by_id=name_by_id, position_by_id=position_by_id),
+        "action_coverage": (with_actions, total_players),
+        "used_heatmap_fallback": used_heatmap_fallback,
     }
 
 
@@ -432,6 +495,11 @@ def main() -> int:
         help="Fetch only this match (use --list-only to find IDs)",
     )
     parser.add_argument("--list-only", action="store_true")
+    parser.add_argument(
+        "--no-heatmap-fallback",
+        action="store_true",
+        help="Do not export heatmap touches when rating-breakdown has no actions",
+    )
     parser.add_argument(
         "--copy-season-to-root",
         action="store_true",
@@ -511,7 +579,12 @@ def main() -> int:
 
         print(f"[{i}/{len(matches)}] {event_id} · {label}")
         try:
-            payload = fetch_match_export(client, event_id, categories=categories)
+            payload = fetch_match_export(
+                client,
+                event_id,
+                categories=categories,
+                heatmap_fallback=not args.no_heatmap_fallback,
+            )
 
             actions_df = pd.DataFrame(payload["actions"], columns=ACTION_COLUMNS)
             stats_df = pd.DataFrame(payload["player_stats"])
@@ -524,10 +597,28 @@ def main() -> int:
             done.add(event_id)
             save_done(done_path, done)
             n_def = int((actions_df["category"] == "defensive").sum()) if not actions_df.empty and "category" in actions_df.columns else 0
+            n_hm = int((actions_df["category"] == "heatmap-touches").sum()) if not actions_df.empty and "category" in actions_df.columns else 0
+            cov = payload.get("action_coverage", (0, 0))
             print(
-                f"  → {len(actions_df)} actions ({n_def} defensive), "
+                f"  → {len(actions_df)} actions ({n_def} defensive, {n_hm} heatmap touches), "
                 f"{len(stats_df)} player-rows, {len(shots_df)} shots"
             )
+            if len(actions_df) == 0:
+                print(
+                    "  WARN: rating-breakdown vazio neste jogo — SofaScore não libera "
+                    "passes/carries com coordenadas para esta competição. "
+                    "Stats e chutes seguem em player_stats / shots."
+                )
+            elif cov[0] == 0 and n_hm:
+                print(
+                    f"  NOTE: rating-breakdown indisponível ({cov[1]} jogadores); "
+                    "usando heatmap como fallback espacial."
+                )
+            elif cov[0] == 0:
+                print(
+                    f"  WARN: 0/{cov[1]} jogadores com rating-breakdown; "
+                    "sem coordenadas de ações."
+                )
             ok += 1
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
