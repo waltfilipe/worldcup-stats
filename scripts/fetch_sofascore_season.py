@@ -203,6 +203,7 @@ def _defensive_actions(pdata) -> list:
     return actions
 
 
+def _match_meta(match) -> dict[str, Any]:
     summary = match.event_detail.summary
     return {
         "event_id": match.event_id,
