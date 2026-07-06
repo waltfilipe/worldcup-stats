@@ -28,6 +28,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+print("[onlypasses] carregando módulos locais …", flush=True)
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 for _path in (SCRIPT_DIR, ROOT):
@@ -56,6 +58,7 @@ def _log(message: str = "") -> None:
 
 def list_finished_matches_verbose(client, tournament_id: int, season_id: int):
     """Like list_finished_matches but prints each round as it is fetched."""
+    _log("  Conectando ao SofaScore (1ª requisição — pode demorar até 30s) …")
     rounds = client.tournament_rounds(tournament_id, season_id)
     total_rounds = len(rounds.rounds)
     _log(f"  {total_rounds} rodadas no calendário — consultando SofaScore …")
@@ -286,10 +289,12 @@ def main() -> int:
     season_path = out_dir / "season_all.csv"
 
     try:
+        _log("Carregando tacoscore + curl_cffi (1ª vez pode levar 20–40s no Windows) …")
         from tacoscore import TacosScoreClient
         from tacoscore.exceptions import APIError
+        _log("Bibliotecas OK.")
     except ImportError:
-        print("Install: pip install -r requirements-sofascore.txt", file=sys.stderr)
+        print("Install: pip install -r requirements-sofascore.txt", file=sys.stderr, flush=True)
         return 1
 
     proxies = _resolve_proxies(args.proxy)
