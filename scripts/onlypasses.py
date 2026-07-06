@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Alias for fetch_sofascore_passes.py (pass coordinates only)."""
+"""Atalho para fetch_sofascore_passes.py (passes com coordenadas)."""
 
 from __future__ import annotations
 
@@ -11,12 +11,10 @@ try:
     from fetch_sofascore_passes import main
 except ImportError as exc:
     print(
-        "\nERRO: não encontrou fetch_sofascore_passes.py na pasta scripts/.\n"
-        "Você precisa dos arquivos:\n"
-        "  scripts/onlypasses.py\n"
-        "  scripts/fetch_sofascore_passes.py\n"
-        "  scripts/fetch_sofascore_season.py\n"
-        "  scripts/sofascore_positions.py\n",
+        "\nERRO: coloque na pasta scripts/:\n"
+        "  onlypasses.py\n"
+        "  fetch_sofascore_passes.py\n"
+        "  sofascore_positions.py\n",
         file=sys.stderr,
         flush=True,
     )

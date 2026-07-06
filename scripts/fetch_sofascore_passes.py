@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -37,18 +39,75 @@ for _path in (SCRIPT_DIR, ROOT):
     if _s not in sys.path:
         sys.path.insert(0, _s)
 
-from fetch_sofascore_season import (  # noqa: E402
-    ACTION_COLUMNS,
-    _proxy_log_label,
-    _resolve_proxies,
-    load_done,
-    parse_tournament_url,
-    save_done,
-)
 from sofascore_positions import resolve_match_positions  # noqa: E402
 
 DEFAULT_OUT = ROOT / "data" / "sofascore"
 PASS_ACTION_TYPES = frozenset({"pass", "cross", "throw-in"})
+
+ACTION_COLUMNS = [
+    "category",
+    "eventActionType",
+    "isHome",
+    "outcome",
+    "keypass",
+    "isLongBall",
+    "start_x",
+    "start_y",
+    "end_x",
+    "end_y",
+    "player_id",
+    "player_name",
+    "position",
+    "event_id",
+    "home_team",
+    "away_team",
+    "match_date",
+]
+
+
+def parse_tournament_url(url: str) -> tuple[int, int]:
+    url = url.strip()
+    if "#id:" not in url:
+        raise ValueError(
+            "URL must include the season fragment, e.g. "
+            "'.../world-championship/16#id:58210'"
+        )
+    path_part, frag = url.split("#id:", 1)
+    season_id = int(frag.split("&")[0].split("/")[0].strip())
+    path_clean = path_part.rstrip("/").split("?")[0]
+    tournament_match = re.search(r"/(\d+)$", path_clean)
+    if not tournament_match:
+        raise ValueError(f"Could not parse tournament id from URL path: {path_part}")
+    return int(tournament_match.group(1)), season_id
+
+
+def load_done(path: Path) -> set[int]:
+    if not path.exists():
+        return set()
+    return set(json.loads(path.read_text(encoding="utf-8")))
+
+
+def save_done(path: Path, done: set[int]) -> None:
+    path.write_text(json.dumps(sorted(done), indent=2), encoding="utf-8")
+
+
+def _resolve_proxies(proxy_url: str | None) -> dict[str, str] | None:
+    url = (
+        proxy_url
+        or os.environ.get("TACOSCORE_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+    )
+    if not url:
+        return None
+    return {"https": url, "http": url}
+
+
+def _proxy_log_label(proxies: dict[str, str]) -> str:
+    url = proxies.get("https", "")
+    if "@" in url:
+        return url.split("@", 1)[1]
+    return url
 
 
 def _log(message: str = "") -> None:
