@@ -2,19 +2,20 @@
 """Collect player minutes per match from SofaScore.
 
 Lightweight: only ``event`` + ``event_lineups`` per match (~2 API calls each).
+Standalone — does not require fetch_sofascore_season.py in the same folder.
 
 Examples::
 
-    # Whole league season
-    python -u scripts/fetch_minutes.py \\
-        --url "https://www.sofascore.com/football/tournament/brazil/brasileirao-serie-a/325#id:72034" \\
-        --output ./brasileirao_2025/minutes_per_match.csv
+    python -u fetch_minutes.py \\
+        --url "https://www.sofascore.com/football/tournament/spain/laliga/8#id:77559" \\
+        --output ./LaLiga_minutes.csv
 
-    # Single match
-    python -u scripts/fetch_minutes.py --event-id 12813008 --output ./allmatch/minutes.csv
+    python -u fetch_minutes.py --event-id 12813008 --output ./minutes.csv
 """
 
 from __future__ import annotations
+
+print("[minutes] iniciando …", flush=True)
 
 import argparse
 import json
@@ -25,13 +26,6 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ROOT = SCRIPT_DIR.parent
-for _path in (SCRIPT_DIR, ROOT):
-    _s = str(_path)
-    if _s not in sys.path:
-        sys.path.insert(0, _s)
-
-from fetch_sofascore_season import list_finished_matches, parse_tournament_url  # noqa: E402
 
 OUTPUT_COLUMNS = [
     "event_id",
@@ -56,17 +50,36 @@ def _log(msg: str = "") -> None:
         print(msg, flush=True)
 
 
-def parse_event_id(value: str) -> int:
-    value = value.strip()
-    if value.isdigit():
-        return int(value)
-    match = re.search(r"/(?:event|match|football/match)/[^/]*/(\d+)", value)
-    if match:
-        return int(match.group(1))
-    match = re.search(r"(\d{6,})", value)
-    if match:
-        return int(match.group(1))
-    raise ValueError(f"Could not parse SofaScore event id from: {value!r}")
+def parse_tournament_url(url: str) -> tuple[int, int]:
+    url = url.strip()
+    if "#id:" not in url:
+        raise ValueError(
+            "URL must include #id:SEASON, e.g. .../laliga/8#id:77559"
+        )
+    path_part, frag = url.split("#id:", 1)
+    season_id = int(frag.split("&")[0].split("/")[0].strip())
+    path_clean = path_part.rstrip("/").split("?")[0]
+    tournament_match = re.search(r"/(\d+)$", path_clean)
+    if not tournament_match:
+        raise ValueError(f"Could not parse tournament id from: {path_part}")
+    return int(tournament_match.group(1)), season_id
+
+
+def list_finished_matches(client, tournament_id: int, season_id: int):
+    _log("  chamando API season_events (pode levar 10–60 s na 1ª vez) …")
+    by_round = client.season_events(tournament_id, season_id)
+    _log(f"  season_events OK · {len(by_round)} rodadas na resposta")
+    matches = []
+    seen: set[int] = set()
+    for match_list in by_round.values():
+        for summary in match_list.events:
+            if summary.event_id in seen:
+                continue
+            seen.add(summary.event_id)
+            if summary.is_finished and summary.has_player_statistics:
+                matches.append(summary)
+    matches.sort(key=lambda m: m.start_timestamp)
+    return matches
 
 
 def _resolve_proxies(proxy_url: str | None) -> dict[str, str] | None:
@@ -113,23 +126,16 @@ def fetch_match_minutes_rows(client, event_id: int) -> list[dict]:
 
 
 def main() -> int:
+    _log("[minutes] parseando argumentos …")
     parser = argparse.ArgumentParser(
         description="Fetch player minutes per match from SofaScore."
     )
-    parser.add_argument(
-        "--url",
-        help="League URL with #id:SEASON (all finished matches in season)",
-    )
-    parser.add_argument(
-        "--event-id",
-        type=int,
-        help="Single match event id (alternative to --url)",
-    )
+    parser.add_argument("--url", help="League URL with #id:SEASON")
+    parser.add_argument("--event-id", type=int, help="Single match event id")
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("minutes_per_match.csv"),
-        help="Output CSV (parent folder created if needed)",
     )
     parser.add_argument("--rate-limit", type=float, default=0.5)
     parser.add_argument("--resume", action="store_true")
@@ -144,15 +150,19 @@ def main() -> int:
     global VERBOSE
     VERBOSE = not args.quiet
 
+    _log("[minutes] importando tacoscore + pandas …")
     try:
         from tacoscore import TacosScoreClient
         import pandas as pd
-    except ImportError:
-        _log("pip install -r requirements-sofascore.txt")
+    except ImportError as exc:
+        _log(f"ERRO import: {exc}")
+        _log("pip install tacoscore curl_cffi pandas")
         return 1
+    _log("[minutes] imports OK")
 
     out_path = args.output.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    _log(f"[minutes] saída → {out_path}")
 
     client = TacosScoreClient(
         rate_limit_seconds=args.rate_limit,
